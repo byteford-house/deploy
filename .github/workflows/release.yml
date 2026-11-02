@@ -116,6 +116,7 @@ jobs:
           # Plant decoys where a working tree could really have them (docker
           # ignore patterns match only at the root unless they start with
           # **/), then list what a COPY of the build context would contain.
+          # The committed *.example templates are meant to be there.
           trap 'rm -rf .ctx-check .env' EXIT
           mkdir -p .ctx-check/svc/.terraform
           echo x > .env
@@ -129,7 +130,7 @@ jobs:
             'FROM alpine:3' \
             'COPY . /ctx' \
             'RUN test -f /ctx/go.mod || { echo "build context is empty: this check proves nothing" >&2; exit 1; }' \
-            'RUN find /ctx \( -name ".env" -o -name ".env.*" -o -name "*.tfstate*" -o -name "*.tfplan" -o -name ".terraform" \) > /leaks; if [ -s /leaks ]; then echo "secret-bearing files reached the build context:" >&2; cat /leaks >&2; exit 1; fi' \
+            'RUN find /ctx \( -name ".env" -o -name ".env.*" -o -name "*.tfstate*" -o -name "*.tfplan" -o -name ".terraform" \) ! -name "*.example" > /leaks; if [ -s /leaks ]; then echo "secret-bearing files reached the build context:" >&2; cat /leaks >&2; exit 1; fi' \
             | docker build --no-cache -f - .
 
       - name: Build image
