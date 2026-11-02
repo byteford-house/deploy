@@ -19,7 +19,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		log.Printf("%s %s %s -> %d (%s)", r.RemoteAddr, r.Method, r.URL.RequestURI(), sw.status, time.Since(start).Round(time.Millisecond))
+		// The OIDC callback's query holds the one-time authorization
+		// code and state; keep them out of the logs.
+		uri := r.URL.RequestURI()
+		if r.URL.Path == callbackPath {
+			uri = r.URL.Path + "?(redacted)"
+		}
+		log.Printf("%s %s %s -> %d (%s)", r.RemoteAddr, r.Method, uri, sw.status, time.Since(start).Round(time.Millisecond))
 	})
 }
 

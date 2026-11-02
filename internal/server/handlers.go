@@ -3,10 +3,31 @@ package server
 import (
 	"log"
 	"net/http"
+	"path/filepath"
+	"time"
 
 	"homelab-deploy/internal/graph"
+	"homelab-deploy/internal/orchestrate"
 	"homelab-deploy/internal/report"
 )
+
+// reportFiles are the only files under .deploy-logs served over HTTP. The
+// directory also holds saved terraform plan files (<dir>.tfplan), which can
+// contain unmasked secret values that the rendered reports redact.
+var reportFiles = map[string]bool{"report.html": true, "report.json": true}
+
+func (s *Server) handleReportFile(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !reportFiles[name] {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, filepath.Join(s.repoRoot, orchestrate.LogDir, name))
+}
+
+// streamRecheck is how often an open job stream re-checks that the viewer's
+// session is still valid. A var so tests can shorten it.
+var streamRecheck = 5 * time.Second
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	g, err := s.discoverGraph()
@@ -92,22 +113,36 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 		dirs = []string{dirParam}
 	}
 
+	// Audit trail: user, kind and dir on every run request, then its
+	// outcome (denied / rejected / started with the job id, which the
+	// "job finished" line repeats). dir is client-supplied, so it is
+	// logged quoted (%q) — a newline in it must not forge a log line.
+	id := identityFrom(r.Context())
 	dirLog := dirParam
 	if dirLog == "" {
 		dirLog = "(all)"
 	}
-	log.Printf("run requested: kind=%s dir=%s from=%s", kind, dirLog, r.RemoteAddr)
+	log.Printf("run requested: user=%q sub=%q kind=%s dir=%q from=%s", id.User, id.Subject, kind, dirLog, r.RemoteAddr)
+
+	// The kind checked here is the very value used below: one read of
+	// the form, so the gate and the runner cannot disagree about it.
+	if need := roleForKind(kind); id.Role < need {
+		log.Printf("run denied: user=%q sub=%q role=%s kind=%s dir=%q needs %s", id.User, id.Subject, id.Role, kind, dirLog, need)
+		http.Error(w, "forbidden: "+kind+" requires the "+need.String()+" role", http.StatusForbidden)
+		return
+	}
 
 	job, err := s.startJob(kind, dirs)
 	if err != nil {
 		// A run is already in progress, or an unknown directory was
 		// requested — either way this is the person's next useful
 		// signal, not a 500.
-		log.Printf("run rejected: kind=%s dir=%s: %v", kind, dirLog, err)
+		// err can embed the client-supplied dir ("unknown directory: ..."), so it is quoted too.
+		log.Printf("run rejected: user=%q sub=%q kind=%s dir=%q: %q", id.User, id.Subject, kind, dirLog, err.Error())
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	log.Printf("job started: id=%s kind=%s dirs=%v", job.ID, job.Kind, job.Dirs)
+	log.Printf("job started: id=%s user=%q sub=%q kind=%s dirs=%q", job.ID, id.User, id.Subject, job.Kind, job.Dirs)
 
 	// Redirect back to the dashboard, not the job page — the dashboard
 	// itself shows a live progress bar (via the same SSE stream the job
@@ -144,10 +179,18 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Stopping an apply mid-step can leave state inconsistent, so it
+	// takes the same role as starting one.
+	who := identityFrom(r.Context())
+	if need := roleForKind(job.Kind); who.Role < need {
+		log.Printf("cancel denied: user=%q sub=%q role=%s id=%s kind=%s needs %s", who.User, who.Subject, who.Role, id, job.Kind, need)
+		http.Error(w, "forbidden: cancelling a "+job.Kind+" job requires the "+need.String()+" role", http.StatusForbidden)
+		return
+	}
 	if job.Cancel() {
-		log.Printf("job cancel requested: id=%s kind=%s from=%s", id, job.Kind, r.RemoteAddr)
+		log.Printf("job cancel requested: id=%s user=%q sub=%q kind=%s from=%s", id, who.User, who.Subject, job.Kind, r.RemoteAddr)
 	} else {
-		log.Printf("job cancel requested but already finished: id=%s from=%s", id, r.RemoteAddr)
+		log.Printf("job cancel requested but already finished: id=%s user=%q sub=%q from=%s", id, who.User, who.Subject, r.RemoteAddr)
 	}
 	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
 }
@@ -169,10 +212,11 @@ func (s *Server) handleConfirmJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := r.FormValue("dir")
+	who := identityFrom(r.Context())
 	if job.Confirm(dir) {
-		log.Printf("apply confirmed: id=%s dir=%s from=%s", id, dir, r.RemoteAddr)
+		log.Printf("apply confirmed: id=%s user=%q sub=%q dir=%q from=%s", id, who.User, who.Subject, dir, r.RemoteAddr)
 	} else {
-		log.Printf("apply confirmation ignored (nothing pending for dir): id=%s dir=%s from=%s", id, dir, r.RemoteAddr)
+		log.Printf("apply confirmation ignored (nothing pending for dir): id=%s user=%q sub=%q dir=%q from=%s", id, who.User, who.Subject, dir, r.RemoteAddr)
 	}
 	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
 }
@@ -192,7 +236,7 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
@@ -200,8 +244,9 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	// (potentially long-lived) connection closes — log the connect/
 	// disconnect separately so a stream that's open for minutes doesn't
 	// look like nothing is happening.
-	log.Printf("stream connected: job=%s from=%s", id, r.RemoteAddr)
-	defer log.Printf("stream disconnected: job=%s from=%s", id, r.RemoteAddr)
+	who := identityFrom(r.Context())
+	log.Printf("stream connected: job=%s user=%q sub=%q from=%s", id, who.User, who.Subject, r.RemoteAddr)
+	defer log.Printf("stream disconnected: job=%s user=%q sub=%q from=%s", id, who.User, who.Subject, r.RemoteAddr)
 
 	replay, live := job.broadcaster.Subscribe()
 	defer job.broadcaster.Unsubscribe(live)
@@ -214,10 +259,20 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
+	recheck := time.NewTicker(streamRecheck)
+	defer recheck.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-recheck.C:
+			// Authentication happened when the stream opened; a long job (or
+			// one paused awaiting confirmation) must not keep streaming to
+			// someone who has since logged out or whose session expired.
+			if !sessionStillValid(ctx) {
+				log.Printf("stream closed: session ended: job=%s", id)
+				return
+			}
 		case frame, ok := <-live:
 			if !ok {
 				return // broadcaster closed: job finished, stream ends

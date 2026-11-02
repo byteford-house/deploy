@@ -11,12 +11,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"path/filepath"
 	"sync"
 
 	"homelab-deploy/internal/graph"
 	"homelab-deploy/internal/manifest"
-	"homelab-deploy/internal/orchestrate"
 	"homelab-deploy/internal/tf"
 )
 
@@ -33,6 +31,7 @@ type Server struct {
 	repoRoot string
 	runner   *tf.Runner
 	resolver *manifest.Resolver // nil = single-repo mode
+	auth     *Auth              // never nil — see newServer
 
 	mu      sync.Mutex
 	current *Job
@@ -48,19 +47,23 @@ const maxJobHistory = 50
 // Serve starts the web dashboard, blocking until the server stops or
 // fails. repoRoot is the same directory the CLI would be run from
 // (services/, config/, infra/ live under it, or a .deploy-repos
-// manifest — see internal/manifest — for multi-repo mode).
-func Serve(repoRoot, addr string) error {
+// manifest — see internal/manifest — for multi-repo mode). auth is
+// required: see Auth for how a request's identity and role are decided.
+func Serve(repoRoot, addr string, auth *Auth) error {
 	runner, err := tf.NewRunner()
 	if err != nil {
 		return err
 	}
-	s, err := newServer(repoRoot, runner)
+	s, err := newServer(repoRoot, runner, auth)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("homelab-deploy web dashboard on http://%s\n", displayAddr(addr))
 	log.Println("request logging enabled — every request and job action is logged below")
+	if auth.disabled {
+		log.Println("WARNING: running with --insecure-no-auth — anyone who can reach this port can plan AND apply")
+	}
 	return http.ListenAndServe(addr, s.Handler())
 }
 
@@ -70,14 +73,18 @@ func Serve(repoRoot, addr string) error {
 // (nil resolver otherwise, i.e. single-repo mode) and wires it into
 // runner once here, so every subsequent terraform invocation resolves
 // paths correctly without any other code needing to know which mode
-// it's in.
-func newServer(repoRoot string, runner *tf.Runner) (*Server, error) {
+// it's in. auth must not be nil: a Server with no auth decision would
+// serve apply to anyone, so that is an error rather than a default.
+func newServer(repoRoot string, runner *tf.Runner, auth *Auth) (*Server, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("server needs an auth configuration (use insecure no-auth explicitly if that is intended)")
+	}
 	resolver, err := manifest.NewResolver(repoRoot)
 	if err != nil {
 		return nil, fmt.Errorf("loading %s: %w", manifest.FileName, err)
 	}
 	runner.SetResolver(resolver)
-	s := &Server{repoRoot: repoRoot, runner: runner, resolver: resolver, jobs: map[string]*Job{}}
+	s := &Server{repoRoot: repoRoot, runner: runner, resolver: resolver, auth: auth, jobs: map[string]*Job{}}
 
 	// Seed "Last" from whatever report.json is already on disk (the CLI's
 	// own last plan/apply, or an earlier server process's) — see
@@ -95,18 +102,39 @@ func newServer(repoRoot string, runner *tf.Runner) (*Server, error) {
 
 // Handler returns the routed http.Handler — used by Serve for the real
 // listener and directly by tests via httptest.NewServer. Every request
-// passes through loggingMiddleware first.
+// passes through loggingMiddleware first, then authentication (which
+// also serves the /auth/* login routes); each route then states the
+// minimum role it needs. Routes that start or
+// steer work (POST) need the planner role at least, and handlers that
+// depend on what is being run (kind=apply, cancelling an apply job)
+// check the applier role themselves.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.handleDashboard)
-	mux.HandleFunc("GET /graph", s.handleGraph)
-	mux.HandleFunc("POST /run", s.handleStartRun)
-	mux.HandleFunc("GET /jobs/{id}", s.handleJobPage)
-	mux.HandleFunc("GET /jobs/{id}/stream", s.handleJobStream)
-	mux.HandleFunc("POST /jobs/{id}/cancel", s.handleCancelJob)
-	mux.HandleFunc("POST /jobs/{id}/confirm", s.handleConfirmJob)
-	mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(s.repoRoot, orchestrate.LogDir)))))
-	return loggingMiddleware(mux)
+	mux.HandleFunc("GET /{$}", require(RoleViewer, s.handleDashboard))
+	mux.HandleFunc("GET /graph", require(RoleViewer, s.handleGraph))
+	mux.HandleFunc("POST /run", require(RolePlanner, s.handleStartRun))
+	mux.HandleFunc("GET /jobs/{id}", require(RoleViewer, s.handleJobPage))
+	mux.HandleFunc("GET /jobs/{id}/stream", require(RoleViewer, s.handleJobStream))
+	mux.HandleFunc("POST /jobs/{id}/cancel", require(RolePlanner, s.handleCancelJob))
+	mux.HandleFunc("POST /jobs/{id}/confirm", require(RoleApplier, s.handleConfirmJob))
+	mux.HandleFunc("GET /logs/{name}", require(RoleViewer, s.handleReportFile))
+	return loggingMiddleware(securityHeaders(s.auth.wrap(mux)))
+}
+
+// securityHeaders is applied to every response, including the login pages
+// and errors. Pages here carry an authenticated user's data and forms whose
+// actions apply infrastructure changes, so they must not be framed by another
+// page (clickjacking; a SameSite=Lax session cookie is still sent to a
+// same-site iframe) and must not be kept by a shared cache.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func displayAddr(addr string) string {

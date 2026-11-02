@@ -21,6 +21,7 @@ work.
 | `--verbose` | `-v` | off | Stream live terraform output to the terminal during `plan`/`apply`, prefixed by directory (`[services/a] ...`), instead of only the one-line summary per directory. Reuses the exact same `Hooks.LiveWriter` mechanism the web server's SSE streaming already uses — no separate code path. Concurrent directories (plan) share one mutex so output can't interleave mid-line. |
 | `--timeout <duration>` | | `0` (none) | Maximum time a `plan`/`apply`/`init` run may take, e.g. `10m`. Without this, a hung provider call blocks forever with no way out except Ctrl+C. Not used by `serve`, which runs indefinitely by design. |
 | `--migrate-backend` | | off | With `init`: migrate to the `[backend]` configured in the env files, after an explicit confirmation. See "Remote backend" below. |
+| `--insecure-no-auth` | | off | `serve` only: run the dashboard with **no authentication**. Without it, `serve` refuses to start unless the `HOMELAB_DEPLOY_OIDC_*` settings are present — see "Authentication and roles" below. |
 
 Verified `--working-dir` for real by running the binary from `/tmp` against
 a repo at `/tmp/flagrepo` — `init`/`plan` operated on the right directory,
@@ -602,7 +603,7 @@ endpoints={ s3 = "https://<account id>.r2.cloudflarestorage.com" }
 ## Web dashboard
 
 ```
-homelab-deploy serve [addr]     # default addr is :8080
+homelab-deploy serve [addr]     # default addr is :8080; needs auth settings (below)
 ```
 
 Click Plan/Apply instead of going back and forth to a terminal, with
@@ -699,14 +700,11 @@ pass).
   shared file (it would otherwise clobber the full multi-directory report
   with a one-directory view) — its result lives on the live job page
   (and, for whichever job ran most recently, on the dashboard itself).
-- **No auth built in, deliberately.** Since `apply` mutates real
-  infrastructure, exposing this without protection would be a bad idea —
-  but you already run Traefik forward-auth through Authentik in front of
-  every other homelab service, so the natural move is deploying this the
-  same way rather than this binary reinventing login/sessions.
+- **Authentication and roles: see the next section.** `serve` does not
+  start without it, unless you pass `--insecure-no-auth`.
 - **Logs what it's actually doing.** Every request gets one access-log
   line (method, path, remote address, status, duration), and `/run`
-  specifically logs what was asked for (`kind=plan dir=services/a`) and
+  specifically logs who asked (`user="alice"`) and what for (`kind=plan dir="services/a"`) and
   the outcome (`job started`/`job finished ... ok`/`FAILED: ...` or
   rejected with why) — so running `serve` in the foreground, or checking
   its logs under systemd/Nomad, actually shows what the browser is
@@ -720,6 +718,143 @@ pass).
   server push into a specific part of a live page with CSS alone, unlike
   the static report's tabs/hover-highlight, which stay pure CSS since
   they don't need to react to anything happening after the page loads.
+
+### Authentication and roles
+
+`serve` signs users in itself with **OpenID Connect** (authorization
+code flow with PKCE), so it needs no auth proxy in front of it. It works
+with any provider that publishes standard OIDC discovery
+(`<issuer>/.well-known/openid-configuration`) and supports the
+authorization code flow. Nothing provider-specific is assumed; the claim
+names are settings. (The test suite runs against a fake provider that
+implements the protocol; it has not been run against a specific
+product, so report any provider that needs a different setting.)
+
+Flow: an unauthenticated browser is redirected to `/auth/login`, then to
+the provider, and back to `/auth/callback`. The server checks the ID
+token (signature against the provider's published keys, issuer, audience
+= your client id, expiry, and the login's nonce), reads the user's
+groups from a claim, and starts a session (an `HttpOnly`,
+`SameSite=Lax` cookie; over https it is `Secure` and named `__Host-hd_session`). Sessions
+are held in memory, so a restart signs everyone out.
+
+| Role | Can |
+|---|---|
+| `viewer` | the dashboard, `/graph`, job pages and their live output (`/jobs/{id}`, `/jobs/{id}/stream`), the static report (`/logs/report.html`, `/logs/report.json`; nothing else under `.deploy-logs`) |
+| `planner` | everything a viewer can, plus `plan`, `init` and `sync` runs, and cancelling those jobs |
+| `applier` | everything a planner can, plus `apply` runs, **confirming** an apply (`/jobs/{id}/confirm`), and cancelling an apply job |
+
+Roles are cumulative. A user's role is the highest one any of their
+groups maps to; groups are matched exactly (case-sensitive, untrimmed).
+Roles are read **at login**, so a group change takes effect the next time
+the user signs in, or when their session expires (`HOMELAB_DEPLOY_SESSION_TTL`
+is the upper bound; shorten it if that is too long). If a user who has lost
+all their groups tries to sign in, every session that account holds is
+revoked immediately.
+
+**The planner role is not a sandbox.** It limits what the buttons do, not
+what Terraform does. `plan` and `apply` use the same runner and the same
+credentials, and Terraform runs provider and data-source code (for example
+an `external` data source) at plan time, and `init` downloads providers and
+modules. Anyone who can change the repository being planned, or the repos
+`sync` pulls, can therefore run code with this server's credentials through
+a planner's `plan`/`init`/`sync`, without ever holding the applier role. Give
+`planner` only to people you would trust with that, and treat write access
+to the repos as equivalent to apply access. If that is not acceptable, the
+fix is separate read-only credentials for planning, which this server does
+not do.
+
+Configure it with environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `HOMELAB_DEPLOY_OIDC_ISSUER` | **Required.** The provider's issuer URL, exactly as it appears in the `iss` claim. Must be https (http only for localhost). Authentik uses a per-application issuer: `https://auth.example.com/application/o/<app-slug>/` (keep the trailing slash). |
+| `HOMELAB_DEPLOY_OIDC_CLIENT_ID` | **Required.** |
+| `HOMELAB_DEPLOY_OIDC_CLIENT_SECRET_FILE` | Path to a file containing the client secret (never the secret itself, so it stays out of env and process arguments). Unset = a public client using PKCE alone, if the provider allows it. |
+| `HOMELAB_DEPLOY_PUBLIC_URL` | **Required.** The address browsers use to reach this server, as just `scheme://host[:port]`, e.g. `https://deploy.example.com`. The provider's redirect URI must be registered as this plus `/auth/callback`, in canonical form: lower-case host, no default port (`https://deploy.example.com/auth/callback`, not `...:443/...`). Must be https (http only for localhost). |
+| `HOMELAB_DEPLOY_VIEWER_GROUPS`, `..._PLANNER_GROUPS`, `..._APPLIER_GROUPS` | Comma-separated group names mapped to each role. At least one must be set. Group names containing a comma cannot be expressed. |
+| `HOMELAB_DEPLOY_OIDC_GROUPS_CLAIM` | ID-token claim holding the groups, default `groups`. A JSON array of strings, or a single string. Nested claims (e.g. Keycloak's `realm_access.roles`) are not supported; use a mapper to emit a top-level claim. |
+| `HOMELAB_DEPLOY_OIDC_USERNAME_CLAIM` | Claim used as the name in logs, default `preferred_username`, then `email`, then `sub`. |
+| `HOMELAB_DEPLOY_OIDC_SCOPES` | Space or comma separated, default `openid profile`. `openid` is always requested. Add whatever scope your provider needs to put groups in the token. |
+| `HOMELAB_DEPLOY_SESSION_TTL` | Session lifetime, default `8h`. |
+
+On the provider side: create a confidential OIDC client with the
+authorization code grant, the redirect URI above, and make sure the ID
+token carries the groups claim. In Authentik that is the `profile` scope on
+recent versions; on others it needs a scope mapping that returns
+`{"groups": [...]}`, so check the ID token your version issues.
+
+**It fails closed.** `serve` exits at startup if any required setting is
+missing, a URL is not https, no group maps to a role, or the provider's
+discovery document cannot be fetched. `--insecure-no-auth` is the only
+way to run without auth; it logs a warning and is refused if any of the
+variables above are also set. (This is a change from earlier versions,
+where `serve` always started open.)
+
+**Transport.** The server itself speaks plain HTTP (`http.ListenAndServe`)
+and relies on a TLS-terminating reverse proxy for https. The `Secure` cookie
+flag only protects the browser-to-proxy leg. The proxy-to-server connection
+must therefore be local to the host or otherwise encrypted and private (a
+loopback or private container network at least): anything that can read it
+sees session cookies, which can be replayed until they expire. Likewise
+`HOMELAB_DEPLOY_PUBLIC_URL` must be the https address the browser uses, or
+the cookies lose `Secure` and the `__Host-` prefix.
+
+Other protections:
+
+- A state-changing request (`POST`) must be same-origin: the browser's
+  `Sec-Fetch-Site: same-origin`, or an `Origin` equal to the public URL
+  (compared as scheme, lower-cased host and effective port); with neither
+  it is refused. This is the CSRF defence, since the session cookie is
+  sent automatically.
+- Every response sends `X-Frame-Options: DENY`, `frame-ancestors 'none'`
+  and `Cache-Control: no-store`, so the pages (which have Apply buttons)
+  cannot be framed by another site, even a sibling subdomain, or kept by a
+  shared cache.
+- Over https the cookies are `__Host-` prefixed (`Secure`, `Path=/`, no
+  `Domain`), so another service under the same parent domain cannot plant
+  its own session or login state in your browser.
+- The login `state` is bound to the browser by a cookie and is single
+  use (checked and consumed atomically); the redirect after login (`next`)
+  can only be a short path on this server, with no backslashes.
+- The discovered authorization, token and JWKS endpoints must be https
+  (loopback excepted), and the HTTP client used for discovery, JWKS and the
+  token exchange refuses redirects to anything else. Only asymmetric
+  signing algorithms are accepted for ID tokens.
+- Group names from the token are matched exactly, with no trimming.
+- Only `report.html` and `report.json` are served from `.deploy-logs`:
+  saved plan files there can contain unmasked secret values.
+- An open job stream ends when its session does (logout or expiry,
+  checked every few seconds), not only at connect time.
+- The one-time authorization code and state are kept out of the logs, and
+  untrusted values in log lines are quoted.
+- A new login replaces the session the browser presented, so re-login
+  really drops the old privileges. One account holds at most 5 sessions
+  (a few devices; the oldest is dropped), so a single account cannot fill
+  the store. Sessions are capped at 1000 overall; at the cap a new login is
+  refused rather than logging someone else out.
+- Two logins started in different tabs share one login cookie: the second
+  start replaces the first, and the first tab's callback then fails and
+  has to be restarted. A stale callback never destroys the other login. Pending logins are capped at 1000 too, and
+  when full the oldest abandoned one is dropped, so a flood of
+  `/auth/login` requests cannot lock real users out (it can still churn
+  them; sustained flooding needs rate limiting at the proxy, since the
+  server cannot tell clients apart behind it).
+
+Every action is logged with `user` (the display claim, which providers
+do not guarantee to be unique or permanent) **and `sub`**, the provider's
+stable subject id, so two accounts with the same name can be told apart.
+Every run request is logged with the user, kind, directory and outcome
+(`run denied` / `run rejected` / `job started id=...`; the later `job
+finished id=...` line carries the same id), plus logins, denied logins
+and denied requests with the reason. Client-supplied values (directory
+names) are logged quoted, so they cannot forge a log line. `POST
+/auth/logout` ends a session.
+
+Not covered yet: the dashboard does not show who is signed in or offer a
+logout button, and does not hide Apply from users who lack the role
+(they get a 403 page). Non-browser clients (scripts, an MCP server) cannot
+authenticate; `Auth.identify` is where a bearer-token check would plug in.
 
 ## Files this creates
 
