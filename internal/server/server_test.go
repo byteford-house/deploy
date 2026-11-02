@@ -104,7 +104,7 @@ func newTestServer(t *testing.T, repoRoot string) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := newServer(repoRoot, runner)
+	s, err := newServer(repoRoot, runner, &Auth{disabled: true}) // these tests exercise behavior, not auth: see auth_test.go
 	if err != nil {
 		t.Fatal(err)
 	}

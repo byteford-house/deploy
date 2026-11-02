@@ -51,6 +51,7 @@ type globalFlags struct {
 	timeout        time.Duration
 	migrateBackend bool
 	nonInteractive bool
+	insecureNoAuth bool
 }
 
 func parseFlags(args []string) (globalFlags, []string, error) {
@@ -69,6 +70,8 @@ func parseFlags(args []string) (globalFlags, []string, error) {
 	fs.BoolVar(&gf.migrateBackend, "migrate-backend", false, "with init: migrate to the [backend] configured in the shared/secrets env file, after an explicit confirmation")
 
 	fs.BoolVar(&gf.nonInteractive, "non-interactive", false, "never prompt (for CI): apply refuses to continue past an unsatisfied .manual-before and skips directories whose backend cannot save a plan, instead of waiting on stdin")
+
+	fs.BoolVar(&gf.insecureNoAuth, "insecure-no-auth", false, "serve only: run the web dashboard with NO authentication, so anyone who can reach the port can plan and apply (otherwise serve refuses to start without the HOMELAB_DEPLOY_* auth settings, see README)")
 
 	if err := fs.Parse(args); err != nil {
 		return globalFlags{}, nil, err
@@ -89,7 +92,7 @@ commands:
   <dir> init --migrate-backend  migrate just one directory
   graph [text|dot]              print the dependency graph
   open                          open the last plan's HTML report in a browser
-  serve [addr]                  start the live web dashboard (default addr :8080)
+  serve [addr]                  start the live web dashboard (default addr :8080); needs auth settings, see README
 
 flags (may appear before or after the command):`
 
@@ -217,7 +220,11 @@ func run(args []string) error {
 		if len(remaining) > 1 {
 			addr = remaining[1]
 		}
-		return server.Serve(repoRoot, addr)
+		auth, err := server.AuthFromEnv(os.Getenv, gf.insecureNoAuth)
+		if err != nil {
+			return fmt.Errorf("serve: %w", err)
+		}
+		return server.Serve(repoRoot, addr, auth)
 	default:
 		info, statErr := os.Stat(filepath.Join(repoRoot, remaining[0]))
 		if err := classifyDirArg(remaining[0], info, statErr); err != nil {

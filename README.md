@@ -21,6 +21,7 @@ work.
 | `--verbose` | `-v` | off | Stream live terraform output to the terminal during `plan`/`apply`, prefixed by directory (`[services/a] ...`), instead of only the one-line summary per directory. Reuses the exact same `Hooks.LiveWriter` mechanism the web server's SSE streaming already uses — no separate code path. Concurrent directories (plan) share one mutex so output can't interleave mid-line. |
 | `--timeout <duration>` | | `0` (none) | Maximum time a `plan`/`apply`/`init` run may take, e.g. `10m`. Without this, a hung provider call blocks forever with no way out except Ctrl+C. Not used by `serve`, which runs indefinitely by design. |
 | `--migrate-backend` | | off | With `init`: migrate to the `[backend]` configured in the env files, after an explicit confirmation. See "Remote backend" below. |
+| `--insecure-no-auth` | | off | `serve` only: run the dashboard with **no authentication**. Without it, `serve` refuses to start unless the `HOMELAB_DEPLOY_*` auth settings are present — see "Authentication and roles" below. |
 
 Verified `--working-dir` for real by running the binary from `/tmp` against
 a repo at `/tmp/flagrepo` — `init`/`plan` operated on the right directory,
@@ -602,7 +603,7 @@ endpoints={ s3 = "https://<account id>.r2.cloudflarestorage.com" }
 ## Web dashboard
 
 ```
-homelab-deploy serve [addr]     # default addr is :8080
+homelab-deploy serve [addr]     # default addr is :8080; needs auth settings (below)
 ```
 
 Click Plan/Apply instead of going back and forth to a terminal, with
@@ -699,14 +700,11 @@ pass).
   shared file (it would otherwise clobber the full multi-directory report
   with a one-directory view) — its result lives on the live job page
   (and, for whichever job ran most recently, on the dashboard itself).
-- **No auth built in, deliberately.** Since `apply` mutates real
-  infrastructure, exposing this without protection would be a bad idea —
-  but you already run Traefik forward-auth through Authentik in front of
-  every other homelab service, so the natural move is deploying this the
-  same way rather than this binary reinventing login/sessions.
+- **Authentication and roles: see the next section.** `serve` does not
+  start without it, unless you pass `--insecure-no-auth`.
 - **Logs what it's actually doing.** Every request gets one access-log
   line (method, path, remote address, status, duration), and `/run`
-  specifically logs what was asked for (`kind=plan dir=services/a`) and
+  specifically logs who asked (`user="alice"`) and what for (`kind=plan dir="services/a"`) and
   the outcome (`job started`/`job finished ... ok`/`FAILED: ...` or
   rejected with why) — so running `serve` in the foreground, or checking
   its logs under systemd/Nomad, actually shows what the browser is
@@ -720,6 +718,68 @@ pass).
   server push into a specific part of a live page with CSS alone, unlike
   the static report's tabs/hover-highlight, which stay pure CSS since
   they don't need to react to anything happening after the page loads.
+
+### Authentication and roles
+
+The server has no login of its own. It trusts the identity the Authentik
+forward-auth proxy (Traefik `forwardAuth` middleware) puts on each
+request, and turns it into one of three roles:
+
+| Role | Can |
+|---|---|
+| `viewer` | the dashboard, `/graph`, job pages and their live output (`/jobs/{id}`, `/jobs/{id}/stream`), the static report under `/logs/` |
+| `planner` | everything a viewer can, plus `plan`, `init` and `sync` runs, and cancelling those jobs |
+| `applier` | everything a planner can, plus `apply` runs, **confirming** an apply (`/jobs/{id}/confirm`), and cancelling an apply job |
+
+Roles are cumulative. A user's role is the highest one any of their
+Authentik groups maps to. Groups are matched exactly (case-sensitive).
+
+Configure it with environment variables (no groups or addresses are
+built in):
+
+| Variable | Meaning |
+|---|---|
+| `HOMELAB_DEPLOY_TRUSTED_PROXIES` | Comma-separated IPs or CIDRs of the proxy, e.g. `10.0.0.0/8` or `172.18.0.5`. **Required.** `0.0.0.0/0` and `::/0` are rejected. |
+| `HOMELAB_DEPLOY_VIEWER_GROUPS` | Comma-separated Authentik group names mapped to `viewer` |
+| `HOMELAB_DEPLOY_PLANNER_GROUPS` | ... to `planner` |
+| `HOMELAB_DEPLOY_APPLIER_GROUPS` | ... to `applier` |
+
+At least one group variable must be set. Group names containing a comma
+cannot be expressed here.
+
+**It fails closed.** `serve` exits at startup if the trusted proxies are
+missing or the groups map to nothing. `--insecure-no-auth` is the only
+way to run without auth, it logs a warning, and it is refused if any of
+the variables above are also set. (This is a change from earlier
+versions, where `serve` always started open.)
+
+How a request is judged, in order:
+
+1. The TCP peer address must be inside `HOMELAB_DEPLOY_TRUSTED_PROXIES`;
+   otherwise **403**, whatever headers it sent. `X-Forwarded-For` is not
+   consulted. Identity headers from anyone but the proxy are ignored
+   because the request never gets that far.
+2. There must be exactly one non-empty `X-authentik-username` header;
+   otherwise **401**. Two values (a client-supplied one next to the
+   proxy's) are refused rather than guessed between.
+3. The pipe-separated `X-authentik-groups` header must contain a mapped
+   group; otherwise **403**.
+4. The route's role check. `/run` is judged on the `kind` it will
+   actually run, so `plan` and `apply` differ.
+
+The check in step 1 is only as strong as the network: **this is safe
+only if the server is reachable solely through the proxy.** If a client
+can connect to the port directly from an address inside the trusted
+range (another container on the same network, say), it can set the
+headers itself. Restrict that in the network config, not here. The proxy
+must also pass the two headers through (`authResponseHeaders` in the
+Traefik middleware lists `X-authentik-username` and `X-authentik-groups`).
+
+Every run request is logged with the user, kind, directory and outcome
+(`run denied` / `run rejected` / `job started id=...`; the later `job
+finished id=...` line carries the same id), plus every denied request
+with its reason. Client-supplied values (directory names) are logged
+quoted, so they cannot forge a log line.
 
 ## Files this creates
 
