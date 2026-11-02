@@ -71,7 +71,7 @@ func parseFlags(args []string) (globalFlags, []string, error) {
 
 	fs.BoolVar(&gf.nonInteractive, "non-interactive", false, "never prompt (for CI): apply refuses to continue past an unsatisfied .manual-before and skips directories whose backend cannot save a plan, instead of waiting on stdin")
 
-	fs.BoolVar(&gf.insecureNoAuth, "insecure-no-auth", false, "serve only: run the web dashboard with NO authentication, so anyone who can reach the port can plan and apply (otherwise serve refuses to start without the HOMELAB_DEPLOY_* auth settings, see README)")
+	fs.BoolVar(&gf.insecureNoAuth, "insecure-no-auth", false, "serve only: run the web dashboard with NO authentication, so anyone who can reach the port can plan and apply (otherwise serve refuses to start without the HOMELAB_DEPLOY_OIDC_* settings, see README)")
 
 	if err := fs.Parse(args); err != nil {
 		return globalFlags{}, nil, err
@@ -220,7 +220,7 @@ func run(args []string) error {
 		if len(remaining) > 1 {
 			addr = remaining[1]
 		}
-		auth, err := server.AuthFromEnv(os.Getenv, gf.insecureNoAuth)
+		auth, err := server.AuthFromEnv(context.Background(), os.Getenv, gf.insecureNoAuth)
 		if err != nil {
 			return fmt.Errorf("serve: %w", err)
 		}

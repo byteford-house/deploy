@@ -21,7 +21,7 @@ work.
 | `--verbose` | `-v` | off | Stream live terraform output to the terminal during `plan`/`apply`, prefixed by directory (`[services/a] ...`), instead of only the one-line summary per directory. Reuses the exact same `Hooks.LiveWriter` mechanism the web server's SSE streaming already uses — no separate code path. Concurrent directories (plan) share one mutex so output can't interleave mid-line. |
 | `--timeout <duration>` | | `0` (none) | Maximum time a `plan`/`apply`/`init` run may take, e.g. `10m`. Without this, a hung provider call blocks forever with no way out except Ctrl+C. Not used by `serve`, which runs indefinitely by design. |
 | `--migrate-backend` | | off | With `init`: migrate to the `[backend]` configured in the env files, after an explicit confirmation. See "Remote backend" below. |
-| `--insecure-no-auth` | | off | `serve` only: run the dashboard with **no authentication**. Without it, `serve` refuses to start unless the `HOMELAB_DEPLOY_*` auth settings are present — see "Authentication and roles" below. |
+| `--insecure-no-auth` | | off | `serve` only: run the dashboard with **no authentication**. Without it, `serve` refuses to start unless the `HOMELAB_DEPLOY_OIDC_*` settings are present — see "Authentication and roles" below. |
 
 Verified `--working-dir` for real by running the binary from `/tmp` against
 a repo at `/tmp/flagrepo` — `init`/`plan` operated on the right directory,
@@ -721,9 +721,22 @@ pass).
 
 ### Authentication and roles
 
-The server has no login of its own. It trusts the identity the Authentik
-forward-auth proxy (Traefik `forwardAuth` middleware) puts on each
-request, and turns it into one of three roles:
+`serve` signs users in itself with **OpenID Connect** (authorization
+code flow with PKCE), so it needs no auth proxy in front of it. It works
+with any provider that publishes standard OIDC discovery
+(`<issuer>/.well-known/openid-configuration`) and supports the
+authorization code flow. Nothing provider-specific is assumed; the claim
+names are settings. (The test suite runs against a fake provider that
+implements the protocol; it has not been run against a specific
+product, so report any provider that needs a different setting.)
+
+Flow: an unauthenticated browser is redirected to `/auth/login`, then to
+the provider, and back to `/auth/callback`. The server checks the ID
+token (signature against the provider's published keys, issuer, audience
+= your client id, expiry, and the login's nonce), reads the user's
+groups from a claim, and starts a session (an `HttpOnly`,
+`SameSite=Lax` cookie; `Secure` when the public URL is https). Sessions
+are held in memory, so a restart signs everyone out.
 
 | Role | Can |
 |---|---|
@@ -732,54 +745,61 @@ request, and turns it into one of three roles:
 | `applier` | everything a planner can, plus `apply` runs, **confirming** an apply (`/jobs/{id}/confirm`), and cancelling an apply job |
 
 Roles are cumulative. A user's role is the highest one any of their
-Authentik groups maps to. Groups are matched exactly (case-sensitive).
+groups maps to; groups are matched exactly (case-sensitive). Roles are
+read **at login**, so a group change takes effect the next time the user
+signs in (or when their session expires).
 
-Configure it with environment variables (no groups or addresses are
-built in):
+Configure it with environment variables:
 
 | Variable | Meaning |
 |---|---|
-| `HOMELAB_DEPLOY_TRUSTED_PROXIES` | Comma-separated IPs or CIDRs of the proxy, e.g. `10.0.0.0/8` or `172.18.0.5`. **Required.** `0.0.0.0/0` and `::/0` are rejected. |
-| `HOMELAB_DEPLOY_VIEWER_GROUPS` | Comma-separated Authentik group names mapped to `viewer` |
-| `HOMELAB_DEPLOY_PLANNER_GROUPS` | ... to `planner` |
-| `HOMELAB_DEPLOY_APPLIER_GROUPS` | ... to `applier` |
+| `HOMELAB_DEPLOY_OIDC_ISSUER` | **Required.** The provider's issuer URL, exactly as it appears in the `iss` claim. Must be https (http only for localhost). Authentik uses a per-application issuer: `https://auth.example.com/application/o/<app-slug>/` (keep the trailing slash). |
+| `HOMELAB_DEPLOY_OIDC_CLIENT_ID` | **Required.** |
+| `HOMELAB_DEPLOY_OIDC_CLIENT_SECRET_FILE` | Path to a file containing the client secret (never the secret itself, so it stays out of env and process arguments). Unset = a public client using PKCE alone, if the provider allows it. |
+| `HOMELAB_DEPLOY_PUBLIC_URL` | **Required.** The address browsers use to reach this server, as just `scheme://host[:port]`, e.g. `https://deploy.example.com`. The provider's redirect URI must be registered as this plus `/auth/callback`. Must be https (http only for localhost). |
+| `HOMELAB_DEPLOY_VIEWER_GROUPS`, `..._PLANNER_GROUPS`, `..._APPLIER_GROUPS` | Comma-separated group names mapped to each role. At least one must be set. Group names containing a comma cannot be expressed. |
+| `HOMELAB_DEPLOY_OIDC_GROUPS_CLAIM` | ID-token claim holding the groups, default `groups`. A JSON array of strings, or a single string. Nested claims (e.g. Keycloak's `realm_access.roles`) are not supported; use a mapper to emit a top-level claim. |
+| `HOMELAB_DEPLOY_OIDC_USERNAME_CLAIM` | Claim used as the name in logs, default `preferred_username`, then `email`, then `sub`. |
+| `HOMELAB_DEPLOY_OIDC_SCOPES` | Space or comma separated, default `openid profile`. `openid` is always requested. Add whatever scope your provider needs to put groups in the token. |
+| `HOMELAB_DEPLOY_SESSION_TTL` | Session lifetime, default `8h`. |
 
-At least one group variable must be set. Group names containing a comma
-cannot be expressed here.
+On the provider side: create a confidential OIDC client with the
+authorization code grant, the redirect URI above, and make sure the ID
+token carries the groups claim. In Authentik that is the `profile` scope on
+recent versions; on others it needs a scope mapping that returns
+`{"groups": [...]}`, so check the ID token your version issues.
 
-**It fails closed.** `serve` exits at startup if the trusted proxies are
-missing or the groups map to nothing. `--insecure-no-auth` is the only
-way to run without auth, it logs a warning, and it is refused if any of
-the variables above are also set. (This is a change from earlier
-versions, where `serve` always started open.)
+**It fails closed.** `serve` exits at startup if any required setting is
+missing, a URL is not https, no group maps to a role, or the provider's
+discovery document cannot be fetched. `--insecure-no-auth` is the only
+way to run without auth; it logs a warning and is refused if any of the
+variables above are also set. (This is a change from earlier versions,
+where `serve` always started open.)
 
-How a request is judged, in order:
+Other protections:
 
-1. The TCP peer address must be inside `HOMELAB_DEPLOY_TRUSTED_PROXIES`;
-   otherwise **403**, whatever headers it sent. `X-Forwarded-For` is not
-   consulted. Identity headers from anyone but the proxy are ignored
-   because the request never gets that far.
-2. There must be exactly one non-empty `X-authentik-username` header;
-   otherwise **401**. Two values (a client-supplied one next to the
-   proxy's) are refused rather than guessed between.
-3. The pipe-separated `X-authentik-groups` header must contain a mapped
-   group; otherwise **403**.
-4. The route's role check. `/run` is judged on the `kind` it will
-   actually run, so `plan` and `apply` differ.
-
-The check in step 1 is only as strong as the network: **this is safe
-only if the server is reachable solely through the proxy.** If a client
-can connect to the port directly from an address inside the trusted
-range (another container on the same network, say), it can set the
-headers itself. Restrict that in the network config, not here. The proxy
-must also pass the two headers through (`authResponseHeaders` in the
-Traefik middleware lists `X-authentik-username` and `X-authentik-groups`).
+- A state-changing request (`POST`) must be same-origin: the browser's
+  `Sec-Fetch-Site: same-origin`, or an `Origin` equal to the public URL;
+  with neither it is refused. This is the CSRF defence, since the session
+  cookie is sent automatically.
+- The login `state` is bound to the browser by a cookie and is single
+  use; the redirect after login (`next`) can only be a path on this server.
+- Only asymmetric signing algorithms are accepted for ID tokens.
+- The one-time authorization code and state are kept out of the logs.
+- Pending logins and sessions are capped (1000 each) so
+  `/auth/login` cannot be used to exhaust memory.
 
 Every run request is logged with the user, kind, directory and outcome
 (`run denied` / `run rejected` / `job started id=...`; the later `job
-finished id=...` line carries the same id), plus every denied request
-with its reason. Client-supplied values (directory names) are logged
-quoted, so they cannot forge a log line.
+finished id=...` line carries the same id), plus logins, denied logins
+and denied requests with the reason. Client-supplied values (directory
+names) are logged quoted, so they cannot forge a log line. `POST
+/auth/logout` ends a session.
+
+Not covered yet: the dashboard does not show who is signed in or offer a
+logout button, and does not hide Apply from users who lack the role
+(they get a 403 page). Non-browser clients (scripts, an MCP server) cannot
+authenticate; `Auth.identify` is where a bearer-token check would plug in.
 
 ## Files this creates
 

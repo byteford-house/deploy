@@ -104,8 +104,9 @@ func newServer(repoRoot string, runner *tf.Runner, auth *Auth) (*Server, error) 
 
 // Handler returns the routed http.Handler — used by Serve for the real
 // listener and directly by tests via httptest.NewServer. Every request
-// passes through loggingMiddleware first, then authentication; each
-// route then states the minimum role it needs. Routes that start or
+// passes through loggingMiddleware first, then authentication (which
+// also serves the /auth/* login routes); each route then states the
+// minimum role it needs. Routes that start or
 // steer work (POST) need the planner role at least, and handlers that
 // depend on what is being run (kind=apply, cancelling an apply job)
 // check the applier role themselves.
@@ -120,7 +121,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /jobs/{id}/confirm", require(RoleApplier, s.handleConfirmJob))
 	logs := http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(s.repoRoot, orchestrate.LogDir))))
 	mux.HandleFunc("GET /logs/", require(RoleViewer, logs.ServeHTTP))
-	return loggingMiddleware(s.auth.authenticate(mux))
+	return loggingMiddleware(s.auth.wrap(mux))
 }
 
 func displayAddr(addr string) string {
