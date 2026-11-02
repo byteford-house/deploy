@@ -1,0 +1,19 @@
+# Secrets and local config must never reach an image layer.
+.env
+.env.*
+!.env.example
+!.env.shared.example
+
+# Run output and checkouts
+.deploy-logs/
+.deploy-repos-checkouts/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Not needed to build
+.git
+.github
+/dist/
+/homelab-deploy

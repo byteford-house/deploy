@@ -4,8 +4,12 @@ name: release
 # building it. Push a tag like v0.1.0 on a main commit whose CI is green.
 #
 # - On a v* tag: builds, checks that CI passed for that exact commit, and
-#   creates a GitHub release with the tarball and SHA256SUMS.
-# - On a PR touching this file: builds and verifies only. Nothing is published.
+#   creates a GitHub release with the tarball and SHA256SUMS. Then the
+#   `image` job (needs: release) builds the container image and pushes it
+#   to ghcr.io. It is a job here, not a separate workflow, because a
+#   release created with GITHUB_TOKEN does not trigger `release:` workflows.
+# - On a PR touching this file or the Dockerfile: builds and verifies only
+#   (binary and image). Nothing is published.
 on:
   push:
     tags:
@@ -13,6 +17,8 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - Dockerfile
+      - .dockerignore
 
 permissions:
   contents: read
@@ -86,3 +92,63 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             "$ASSET" SHA256SUMS
+
+  # Container image: Dockerfile builds the same binary from this commit,
+  # on top of alpine with terraform (latest at build time), git and ssh.
+  # Pushes to ghcr.io only for a v* tag, and only after `release` succeeded.
+  image:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # pushing to ghcr.io; used only by the tag-only push step
+    env:
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'pr-test' }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          repo="$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tag="${VERSION#v}"
+          echo "IMAGE=ghcr.io/${repo}" >> "$GITHUB_ENV"
+          echo "TAG=${tag}" >> "$GITHUB_ENV"
+          # --pull: always take the current base images, including terraform:latest.
+          docker build --pull \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${tag}" \
+            -t "ghcr.io/${repo}:${tag}" .
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          img="${IMAGE}:${TAG}"
+          # --help prints usage and exits 0 without needing terraform.
+          docker run --rm "$img" --help > /dev/null 2>&1
+          docker run --rm --entrypoint terraform "$img" version
+          docker run --rm --entrypoint git "$img" --version
+          docker run --rm --entrypoint ssh "$img" -V
+          uid="$(docker run --rm --entrypoint id "$img" -u)"
+          [ "$uid" = "10001" ] || { echo "image runs as uid $uid, want 10001 (non-root)" >&2; exit 1; }
+
+      - name: Push image (tags only)
+        if: env.IS_TAG == 'true'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "${IMAGE}:${TAG}"
+          # A pre-release (v1.2.3-rc1) must not move `latest`.
+          case "$TAG" in
+            *-*) echo "pre-release: not tagging latest" ;;
+            *)
+              docker tag "${IMAGE}:${TAG}" "${IMAGE}:latest"
+              docker push "${IMAGE}:latest"
+              ;;
+          esac
