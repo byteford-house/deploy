@@ -6,15 +6,30 @@ job "[[ var "job_name" . ]]" {
 
   group "homelab-deploy" {
     # One instance: sessions are in memory and there is a single job slot.
-    # The single-node-writer volume also stops a second copy from starting.
     count = 1
+[[- if var "pin_to_node" . ]]
+
+    constraint {
+      attribute = "${attr.unique.hostname}"
+      value     = "[[ var "pin_to_node" . ]]"
+    }
+[[- end ]]
+[[- if eq (var "work_volume_type" .) "csi" ]]
 
     volume "work" {
       type            = "csi"
-      source          = "[[ var "csi_volume_name" . ]]"
+      source          = "[[ var "work_volume" . ]]"
       access_mode     = "single-node-writer"
       attachment_mode = "file-system"
     }
+[[- else if eq (var "work_volume_type" .) "host" ]]
+
+    volume "work" {
+      type      = "host"
+      source    = "[[ var "work_volume" . ]]"
+      read_only = false
+    }
+[[- end ]]
 
     network {
       mode = "host"
@@ -47,7 +62,7 @@ job "[[ var "job_name" . ]]" {
     }
 [[- if var "fix_volume_ownership" . ]]
 
-    # A fresh CSI volume is usually root-owned; the image runs as uid 10001.
+    # A fresh volume or directory is usually root-owned; the image runs as uid 10001.
     task "volume-ownership" {
       driver = "podman"
 
@@ -61,13 +76,18 @@ job "[[ var "job_name" . ]]" {
         user       = "root"
         entrypoint = ["/bin/chown"]
         args       = ["10001:10001", "/work"]
+[[- if eq (var "work_volume_type" .) "bind" ]]
+        volumes    = ["[[ var "work_volume" . ]]:/work"]
+[[- end ]]
       }
+[[- if ne (var "work_volume_type" .) "bind" ]]
 
       volume_mount {
         volume      = "work"
         destination = "/work"
         read_only   = false
       }
+[[- end ]]
 
       resources {
         cpu    = 50
@@ -86,6 +106,9 @@ job "[[ var "job_name" . ]]" {
       config {
         image        = "[[ var "image_repository" . ]]:[[ var "image_tag" . ]]"
         network_mode = "host"
+[[- if eq (var "work_volume_type" .) "bind" ]]
+        volumes      = ["[[ var "work_volume" . ]]:/work"]
+[[- end ]]
         # The image entrypoint is homelab-deploy; a shell wrapper is needed
         # only to sync the checkout before serving. exec keeps serve as the
         # main process so it receives the stop signal.
@@ -107,11 +130,14 @@ job "[[ var "job_name" . ]]" {
         max_file_size = 10
       }
 
+[[- if ne (var "work_volume_type" .) "bind" ]]
+
       volume_mount {
         volume      = "work"
         destination = "/work"
         read_only   = false
       }
+[[- end ]]
 
       # Not secret. The three group variables map Authentik groups to roles.
       env {

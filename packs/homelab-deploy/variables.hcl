@@ -38,14 +38,25 @@ variable "domain" {
 
 # --- Storage ---
 
-variable "csi_volume_name" {
+variable "work_volume_type" {
   type        = string
-  description = "Existing CSI volume mounted at /work: the Terraform repo (or .deploy-repos checkouts), local state if no remote backend, and .deploy-logs/."
+  description = "How /work is provided. Required, no default (nothing is assumed): csi = CSI volume (single-node-writer), host = Nomad host volume declared in the client config, bind = host path bind-mounted by podman. Any other value fails job validation."
+}
+
+variable "work_volume" {
+  type        = string
+  description = "What work_volume_type points at: the CSI volume id, the host volume name, or an absolute host path. /work holds the Terraform repo (or .deploy-repos checkouts), local state if no remote backend, and .deploy-logs/."
+}
+
+variable "pin_to_node" {
+  type        = string
+  description = "Optional node hostname (attr.unique.hostname) to constrain placement to. Recommended for bind: a host path exists on one node only, and on another node podman would start on an empty directory. Host volumes already limit placement to nodes that declare them; CSI does not need it."
+  default     = ""
 }
 
 variable "fix_volume_ownership" {
   type        = bool
-  description = "Run a short prestart task as root that chowns /work to uid 10001 (the image user). Turn off if the volume cannot be chowned (e.g. NFS root_squash) and is already writable by 10001."
+  description = "Run a short prestart task as root that chowns /work to uid 10001 (the image user). Turn off if it cannot be chowned (e.g. NFS root_squash) and is already writable by 10001."
   default     = true
 }
 

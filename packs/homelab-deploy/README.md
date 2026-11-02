@@ -15,12 +15,16 @@ volume names in the stack that calls the pack, not here.
 
 ## What it runs
 
-- One group, `count = 1` (sessions are in memory, one job slot). The
-  `single-node-writer` CSI volume also prevents a second copy.
+- One group, `count = 1` (sessions are in memory, one job slot).
+- `/work` comes from `work_volume_type` (required, nothing is assumed):
+  `csi` (single-node-writer, which also stops a second copy starting),
+  `host` (Nomad host volume; only nodes that declare it are eligible) or
+  `bind` (host path bind-mounted by podman; set `pin_to_node`, since the path
+  exists on one node only). An unknown value fails job validation.
 - Image `ghcr.io/byteford/deploy:<image_tag>` (public). Runs as uid 10001,
   working dir `/work`.
 - Optional prestart task `volume-ownership` (default on): `chown 10001:10001 /work`
-  as root, because a fresh CSI volume is usually root-owned.
+  as root, because a fresh volume or directory is usually root-owned.
 - Main task starts `homelab-deploy --env-file /secrets/.env -C /work serve
   $NOMAD_ADDR_http`, bound to the allocation's node address and dynamic port,
   not all interfaces. With `deploy_repos` set it first copies the manifest
@@ -45,7 +49,8 @@ onto the volume and never into the repo.
 
 ## One-off steps outside this pack (not automated)
 
-1. Create the CSI volume (`csi_volume_name`).
+1. Provide the working-dir storage (`work_volume`): create the CSI volume,
+   declare the host volume in the client config, or create the host path.
 2. Write the Vault secret fields above and a Vault role/policy that can read it
    (`vault_access_role`).
 3. Create the OIDC application at the provider: confidential client, auth
@@ -71,7 +76,8 @@ onto the volume and never into the repo.
 
 ## Variables
 
-See `variables.hcl`. Required: `image_tag`, `domain`, `csi_volume_name`,
+See `variables.hcl`. Required: `image_tag`, `domain`, `work_volume_type`,
+`work_volume`,
 `vault_access_role`, `oidc_issuer`, `oidc_client_id`. At least one of the
 three `*_groups` must be set or the app exits at start (it fails closed).
 
