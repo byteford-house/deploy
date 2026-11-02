@@ -64,6 +64,12 @@ const (
 	loginStateTTL     = 10 * time.Minute
 	maxLiveEntries    = 1000 // cap on pending logins and on sessions, so unauthenticated /auth/login cannot grow memory without bound
 
+	maxNextLen = 512 // longest post-login return path kept; stops 1000 pending logins retaining ~1 MiB each
+
+	// Cookie base names. Over https they are prefixed "__Host-", which
+	// makes a browser refuse any copy set by a sibling subdomain (it
+	// requires Secure, Path=/ and no Domain), so a neighbouring service
+	// cannot plant its own session or login state in a victim's browser.
 	sessionCookie = "hd_session"
 	loginCookie   = "hd_login"
 	callbackPath  = "/auth/callback"
@@ -126,6 +132,16 @@ type Identity struct {
 }
 
 type identityKey struct{}
+type sessionCheckKey struct{}
+
+// sessionStillValid reports whether the request's session is still live.
+// With auth disabled there is no session to end.
+func sessionStillValid(ctx context.Context) bool {
+	if f, ok := ctx.Value(sessionCheckKey{}).(func() bool); ok {
+		return f()
+	}
+	return true
+}
 
 func identityFrom(ctx context.Context) Identity {
 	id, _ := ctx.Value(identityKey{}).(Identity)
@@ -169,9 +185,19 @@ func NewAuth(ctx context.Context, cfg AuthConfig) (*Auth, error) {
 		usernameClaim: orDefault(cfg.UsernameClaim, "preferred_username"),
 		ttl:           cfg.SessionTTL,
 		now:           cfg.Now,
-		origin:        pub.Scheme + "://" + pub.Host,
-		secureCookies: pub.Scheme == "https",
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		origin:        canonicalOrigin(pub),
+		secureCookies: strings.EqualFold(pub.Scheme, "https"),
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+			// Discovery, JWKS and the token exchange carry the code,
+			// PKCE verifier and client secret: never follow a redirect to cleartext.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return errors.New("stopped after 10 redirects")
+				}
+				return requireSecureURL("redirect target", req.URL.String())
+			},
+		},
 	}
 	if a.now == nil {
 		a.now = time.Now
@@ -182,8 +208,11 @@ func NewAuth(ctx context.Context, cfg AuthConfig) (*Auth, error) {
 	if a.ttl == 0 {
 		a.ttl = defaultSessionTTL
 	}
-	a.sessions = newExpiringStore[Identity](maxLiveEntries, a.now)
-	a.pending = newExpiringStore[pendingLogin](maxLiveEntries, a.now)
+	// Sessions never evict: dropping a live user's session to make room would
+	// be a logout. Pending logins do: they are cheap, anyone can create them,
+	// and refusing new ones when full would let a flood lock everyone out.
+	a.sessions = newExpiringStore[Identity](maxLiveEntries, a.now, false)
+	a.pending = newExpiringStore[pendingLogin](maxLiveEntries, a.now, true)
 
 	// Lowest role first, so a group listed under two roles keeps the higher one.
 	for _, m := range []struct {
@@ -205,15 +234,35 @@ func NewAuth(ctx context.Context, cfg AuthConfig) (*Auth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery for %s failed: %w", cfg.Issuer, err)
 	}
+
+	// A https issuer may still advertise cleartext endpoints (a proxy that
+	// hides the scheme from the provider is the usual cause). The code
+	// exchange would then send the code, verifier and secret in the clear.
+	var disc struct {
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := provider.Claims(&disc); err != nil {
+		return nil, fmt.Errorf("OIDC discovery for %s: %w", cfg.Issuer, err)
+	}
+	ep := provider.Endpoint()
+	for _, e := range []struct{ name, u string }{{"authorization_endpoint", ep.AuthURL}, {"token_endpoint", ep.TokenURL}, {"jwks_uri", disc.JWKSURI}} {
+		if err := requireSecureURL("discovered "+e.name, e.u); err != nil {
+			return nil, fmt.Errorf("OIDC discovery for %s: %w", cfg.Issuer, err)
+		}
+	}
 	a.verifier = provider.VerifierContext(ctx, &oidc.Config{ClientID: cfg.ClientID, SupportedSigningAlgs: signingAlgs, Now: a.now})
 
 	scopes := []string{"openid"}
+	configured := false
 	for _, s := range cfg.Scopes {
-		if s = strings.TrimSpace(s); s != "" && s != "openid" {
-			scopes = append(scopes, s)
+		if s = strings.TrimSpace(s); s != "" {
+			configured = true
+			if s != "openid" {
+				scopes = append(scopes, s)
+			}
 		}
 	}
-	if len(scopes) == 1 {
+	if !configured { // the default applies only when nothing was configured
 		scopes = append(scopes, "profile")
 	}
 	a.oauth = oauth2.Config{
@@ -231,6 +280,38 @@ func orDefault(v, def string) string {
 		return v
 	}
 	return def
+}
+
+// canonicalOrigin is scheme://host[:port] the way a browser serializes an
+// Origin: lower-case, default port dropped. Both the configured public URL
+// and an incoming Origin header go through it before being compared.
+func canonicalOrigin(u *url.URL) string {
+	scheme, host, port := strings.ToLower(u.Scheme), strings.ToLower(u.Hostname()), u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if strings.Contains(host, ":") { // IPv6 literal
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host
+}
+
+// cookieName is the name a cookie is set and read under (see sessionCookie).
+func (a *Auth) cookieName(base string) string {
+	if a.secureCookies {
+		return "__Host-" + base
+	}
+	return base
+}
+
+// setCookie sets or (maxAge < 0) clears a cookie with the attributes the
+// __Host- prefix demands. Clearing must repeat them or the browser ignores it.
+func (a *Auth) setCookie(w http.ResponseWriter, base, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{Name: a.cookieName(base), Value: value, Path: "/", MaxAge: maxAge,
+		HttpOnly: true, Secure: a.secureCookies, SameSite: http.SameSiteLaxMode})
 }
 
 // requireSecureURL insists on https, except for a loopback host (local
@@ -341,11 +422,15 @@ func (a *Auth) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !safeMethod(r.Method) && !a.sameOrigin(r) {
-			log.Printf("auth denied: user=%q cross-origin %s %s (Origin=%q Sec-Fetch-Site=%q)", id.User, r.Method, r.URL.Path, r.Header.Get("Origin"), r.Header.Get("Sec-Fetch-Site"))
+			log.Printf("auth denied: user=%q cross-origin %s %q (Origin=%q Sec-Fetch-Site=%q)", id.User, r.Method, r.URL.Path, r.Header.Get("Origin"), r.Header.Get("Sec-Fetch-Site"))
 			http.Error(w, "forbidden: cross-origin request", http.StatusForbidden)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
+		ctx := context.WithValue(r.Context(), identityKey{}, id)
+		// Long-lived responses (the SSE stream) re-check this, so they end
+		// when the session does instead of outliving a logout or expiry.
+		ctx = context.WithValue(ctx, sessionCheckKey{}, func() bool { _, ok := a.identify(r); return ok })
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -355,7 +440,7 @@ func (a *Auth) authenticate(next http.Handler) http.Handler {
 // groups through a.roleFor, and return the same Identity, so require(),
 // the audit log and the roles need no change.
 func (a *Auth) identify(r *http.Request) (Identity, bool) {
-	c, err := r.Cookie(sessionCookie)
+	c, err := r.Cookie(a.cookieName(sessionCookie))
 	if err != nil || c.Value == "" {
 		return Identity{}, false
 	}
@@ -382,8 +467,11 @@ func (a *Auth) sameOrigin(r *http.Request) bool {
 	if s := r.Header.Get("Sec-Fetch-Site"); s != "" {
 		return s == "same-origin"
 	}
-	o := r.Header.Get("Origin")
-	return o != "" && o == a.origin
+	u, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return false // absent, "null", or not an origin
+	}
+	return canonicalOrigin(u) == a.origin
 }
 
 func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -395,21 +483,17 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	// The state is also bound to this browser by a cookie, so a callback
 	// URL an attacker prepared cannot be completed by a victim (login CSRF).
-	http.SetCookie(w, &http.Cookie{Name: loginCookie, Value: state, Path: "/auth/", MaxAge: int(loginStateTTL.Seconds()),
-		HttpOnly: true, Secure: a.secureCookies, SameSite: http.SameSiteLaxMode})
-	w.Header().Set("Cache-Control", "no-store")
+	a.setCookie(w, loginCookie, state, int(loginStateTTL.Seconds()))
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(p.nonce), oauth2.S256ChallengeOption(p.verifier)), http.StatusFound)
 }
 
 func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
 	q := r.URL.Query()
 	state := q.Get("state")
 
 	// The login cookie and pending state are single use, whatever happens next.
-	c, cerr := r.Cookie(loginCookie)
-	http.SetCookie(w, &http.Cookie{Name: loginCookie, Value: "", Path: "/auth/", MaxAge: -1,
-		HttpOnly: true, Secure: a.secureCookies, SameSite: http.SameSiteLaxMode})
+	c, cerr := r.Cookie(a.cookieName(loginCookie))
+	a.setCookie(w, loginCookie, "", -1)
 	if cerr != nil || state == "" || subtle.ConstantTimeCompare([]byte(c.Value), []byte(state)) != 1 {
 		log.Printf("login failed: state cookie missing or mismatched (from %s)", r.RemoteAddr)
 		http.Error(w, "login failed: start again at /auth/login", http.StatusBadRequest)
@@ -476,18 +560,16 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many sessions, try again shortly", http.StatusServiceUnavailable)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: sid, Path: "/", MaxAge: int(a.ttl.Seconds()),
-		HttpOnly: true, Secure: a.secureCookies, SameSite: http.SameSiteLaxMode})
+	a.setCookie(w, sessionCookie, sid, int(a.ttl.Seconds()))
 	log.Printf("login: user=%q sub=%q role=%s", user, idt.Subject, role)
 	http.Redirect(w, r, p.next, http.StatusSeeOther)
 }
 
 func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, err := r.Cookie(a.cookieName(sessionCookie)); err == nil {
 		a.sessions.delete(c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1,
-		HttpOnly: true, Secure: a.secureCookies, SameSite: http.SameSiteLaxMode})
+	a.setCookie(w, sessionCookie, "", -1)
 	log.Printf("logout: user=%q", identityFrom(r.Context()).User)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!doctype html><title>Signed out</title><p>Signed out. <a href="/auth/login">Sign in again</a></p>`)
@@ -522,11 +604,13 @@ func claimStrings(v any) []string {
 }
 
 // roleFor returns the highest role any of the user's groups maps to.
-// Groups are matched exactly (case-sensitive).
+// Groups are matched exactly: case-sensitive and untrimmed, so " admins "
+// (a different group to the provider) is not "admins". Only the configured
+// names are trimmed, once, when the mapping is built.
 func (a *Auth) roleFor(groups []string) Role {
 	best := RoleNone
 	for _, g := range groups {
-		if r := a.groups[strings.TrimSpace(g)]; r > best {
+		if r := a.groups[g]; r > best {
 			best = r
 		}
 	}
@@ -535,8 +619,14 @@ func (a *Auth) roleFor(groups []string) Role {
 
 // safeNext only lets a login return to a path on this server, never
 // another site (open redirect) or back into the login flow.
+//
+// Backslashes are refused anywhere: http.Redirect runs path.Clean on the
+// target, so "/a/../\\evil.example" would come out as "/\\evil.example", which
+// browsers read as "//evil.example". The length cap bounds what each pending
+// login retains, and the result is copied so it cannot pin a larger request buffer.
 func safeNext(next string) string {
-	if next == "" || next[0] != '/' || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") || strings.HasPrefix(next, "/auth/") {
+	if next == "" || len(next) > maxNextLen || next[0] != '/' || strings.Contains(next, "\\") ||
+		strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/auth/") {
 		return "/"
 	}
 	if u, err := url.Parse(next); err != nil || u.Host != "" || u.Scheme != "" {
@@ -547,7 +637,7 @@ func safeNext(next string) string {
 			return "/"
 		}
 	}
-	return next
+	return strings.Clone(next)
 }
 
 func randToken() string {
@@ -560,10 +650,11 @@ func randToken() string {
 
 // expiringStore is a small bounded in-memory map whose entries lapse.
 type expiringStore[T any] struct {
-	mu  sync.Mutex
-	m   map[string]storeEntry[T]
-	max int
-	now func() time.Time
+	mu          sync.Mutex
+	m           map[string]storeEntry[T]
+	max         int
+	now         func() time.Time
+	evictOldest bool // when full of live entries: drop the oldest instead of refusing
 }
 
 type storeEntry[T any] struct {
@@ -571,11 +662,12 @@ type storeEntry[T any] struct {
 	exp time.Time
 }
 
-func newExpiringStore[T any](max int, now func() time.Time) *expiringStore[T] {
-	return &expiringStore[T]{m: map[string]storeEntry[T]{}, max: max, now: now}
+func newExpiringStore[T any](max int, now func() time.Time, evictOldest bool) *expiringStore[T] {
+	return &expiringStore[T]{m: map[string]storeEntry[T]{}, max: max, now: now, evictOldest: evictOldest}
 }
 
-// put stores v, first dropping lapsed entries; false means the store is full.
+// put stores v, first dropping lapsed entries. When the store is still full
+// it evicts the oldest entry (evictOldest) or reports false.
 func (s *expiringStore[T]) put(key string, v T, ttl time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -586,9 +678,19 @@ func (s *expiringStore[T]) put(key string, v T, ttl time.Duration) bool {
 				delete(s.m, k)
 			}
 		}
-		if len(s.m) >= s.max {
+	}
+	if len(s.m) >= s.max {
+		if !s.evictOldest {
 			return false
 		}
+		var oldest string
+		var oldestExp time.Time
+		for k, e := range s.m {
+			if oldest == "" || e.exp.Before(oldestExp) {
+				oldest, oldestExp = k, e.exp
+			}
+		}
+		delete(s.m, oldest)
 	}
 	s.m[key] = storeEntry[T]{v: v, exp: now.Add(ttl)}
 	return true
@@ -605,11 +707,17 @@ func (s *expiringStore[T]) get(key string) (T, bool) {
 	return e.v, ok
 }
 
-// take is get plus delete: a single-use lookup.
+// take is a single-use lookup. Lookup, expiry check and delete happen under
+// one lock, so two concurrent callers can never both receive the same entry.
 func (s *expiringStore[T]) take(key string) (T, bool) {
-	v, ok := s.get(key)
-	s.delete(key)
-	return v, ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[key]
+	delete(s.m, key)
+	if ok && !s.now().Before(e.exp) {
+		ok = false
+	}
+	return e.v, ok
 }
 
 func (s *expiringStore[T]) delete(key string) {
@@ -623,7 +731,7 @@ func (s *expiringStore[T]) delete(key string) {
 func require(min Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if id := identityFrom(r.Context()); id.Role < min {
-			log.Printf("auth denied: user=%q role=%s needs %s for %s %s", id.User, id.Role, min, r.Method, r.URL.Path)
+			log.Printf("auth denied: user=%q role=%s needs %s for %s %q", id.User, id.Role, min, r.Method, r.URL.Path)
 			http.Error(w, "forbidden: requires the "+min.String()+" role", http.StatusForbidden)
 			return
 		}

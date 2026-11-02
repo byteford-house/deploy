@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,7 +101,7 @@ func (h *harness) do(r req) *httptest.ResponseRecorder {
 func (h *harness) sessionFor(user string, role Role) *http.Cookie {
 	tok := randToken()
 	h.auth.sessions.put(tok, Identity{User: user, Subject: "sub-" + user, Role: role}, time.Hour)
-	return &http.Cookie{Name: sessionCookie, Value: tok}
+	return &http.Cookie{Name: h.auth.cookieName(sessionCookie), Value: tok}
 }
 
 func cookieNamed(rec *httptest.ResponseRecorder, name string) *http.Cookie {
@@ -134,14 +136,14 @@ func (h *harness) startLogin(next string) (authURL, state string, loginC *http.C
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	return authURL, u.Query().Get("state"), cookieNamed(rec, loginCookie)
+	return authURL, u.Query().Get("state"), cookieNamed(rec, h.auth.cookieName(loginCookie))
 }
 
 func (h *harness) callback(code, state string, cookies ...*http.Cookie) loginResult {
 	h.t.Helper()
 	rec := h.do(req{method: "GET", path: callbackPath + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state), cookies: cookies})
 	r := loginResult{rec: rec}
-	if c := cookieNamed(rec, sessionCookie); c != nil && c.Value != "" && c.MaxAge >= 0 {
+	if c := cookieNamed(rec, h.auth.cookieName(sessionCookie)); c != nil && c.Value != "" && c.MaxAge >= 0 {
 		r.session = c
 	}
 	return r
@@ -264,15 +266,19 @@ func TestLogin_WrongClientSecretIsRejected(t *testing.T) {
 func TestLogin_NextCannotLeaveTheSite(t *testing.T) {
 	h := newHarness(t, nil)
 	for next, want := range map[string]string{
-		"/jobs/abc":            "/jobs/abc",
-		"/?filter=changes":     "/?filter=changes",
-		"":                     "/",
-		"https://evil.example": "/",
-		"//evil.example":       "/",
-		"/\\evil.example":      "/",
-		"evil":                 "/",
-		"/auth/login":          "/", // no loops back into the flow
-		"/ok\r\nSet-Cookie: x": "/",
+		"/jobs/abc":                             "/jobs/abc",
+		"/?filter=changes":                      "/?filter=changes",
+		"":                                      "/",
+		"https://evil.example":                  "/",
+		"//evil.example":                        "/",
+		"/\\evil.example":                       "/",
+		"evil":                                  "/",
+		"/auth/login":                           "/", // no loops back into the flow
+		"/ok\r\nSet-Cookie: x":                  "/",
+		"/a/../\\evil.example":                  "/", // http.Redirect cleans this to /\evil.example, which browsers read as //evil.example
+		"/a\\b":                                 "/",
+		"/" + strings.Repeat("a", maxNextLen):   "/", // longer than maxNextLen
+		"/" + strings.Repeat("a", maxNextLen-1): "/" + strings.Repeat("a", maxNextLen-1),
 	} {
 		res := h.login(next, nil, "")
 		if got := res.rec.Header().Get("Location"); got != want {
@@ -303,6 +309,7 @@ func TestCallback_RejectsBadTokens(t *testing.T) {
 		{"groups claim wrong type", func(c map[string]any) { c["groups"] = 42 }, "", 403},
 		{"group name differs in case", func(c map[string]any) { c["groups"] = []string{"DEPLOY-APPLIERS"} }, "", 403},
 		{"empty groups", func(c map[string]any) { c["groups"] = []string{} }, "", 403},
+		{"group name padded with spaces is a different group", func(c map[string]any) { c["groups"] = []string{" deploy-appliers "} }, "", 403},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -411,19 +418,32 @@ func TestCallback_CodeAndStateAreNotLogged(t *testing.T) {
 	}
 }
 
-func TestLogin_PendingLoginsAreBounded(t *testing.T) {
+func TestLogin_PendingLoginsAreBoundedButNeverLockOutNewLogins(t *testing.T) {
 	h := newHarness(t, nil)
+	var firstState string
+	var firstCookie *http.Cookie
 	for i := 0; i < maxLiveEntries; i++ {
-		if rec := h.do(req{method: "GET", path: "/auth/login"}); rec.Code != http.StatusFound {
+		rec := h.do(req{method: "GET", path: "/auth/login"})
+		if rec.Code != http.StatusFound {
 			t.Fatalf("login %d = %d, want 302", i, rec.Code)
 		}
+		if i == 0 {
+			firstCookie = cookieNamed(rec, h.auth.cookieName(loginCookie))
+			firstState = firstCookie.Value
+		}
+		h.clock.Advance(time.Millisecond) // distinct ages, so "oldest" is well defined
 	}
-	if rec := h.do(req{method: "GET", path: "/auth/login"}); rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("login past the cap = %d, want 503", rec.Code)
+	// A flood of abandoned logins must not make the next real login fail...
+	authURL, state, lc := h.startLogin("")
+	if res := h.callback(h.op.approve(authURL, nil, ""), state, lc); res.session == nil {
+		t.Errorf("a login after the store filled up failed: %d", res.rec.Code)
 	}
-	h.clock.Advance(loginStateTTL + time.Second) // lapsed entries free the space
-	if rec := h.do(req{method: "GET", path: "/auth/login"}); rec.Code != http.StatusFound {
-		t.Errorf("login after entries lapsed = %d, want 302", rec.Code)
+	// ...at the price of the oldest abandoned one, and memory stays bounded.
+	if n := len(h.auth.pending.m); n > maxLiveEntries {
+		t.Errorf("pending store holds %d entries, cap is %d", n, maxLiveEntries)
+	}
+	if _, ok := h.auth.pending.get(firstState); ok {
+		t.Error("the oldest pending login should have been evicted to make room")
 	}
 }
 
@@ -923,5 +943,301 @@ func TestBrowserFlow_RealHTTP(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound || !strings.HasPrefix(resp.Header.Get("Location"), "/auth/login") {
 		t.Errorf("after logout GET /graph = %d -> %q, want 302 to /auth/login", resp.StatusCode, resp.Header.Get("Location"))
+	}
+}
+
+// ---- review round: hardening ---------------------------------------------------
+
+func TestNewAuth_RejectsInsecureDiscoveredEndpoints(t *testing.T) {
+	for _, field := range []string{"authorization_endpoint", "token_endpoint", "jwks_uri"} {
+		t.Run(field, func(t *testing.T) {
+			clock := newTestClock()
+			op := newFakeOP(t, clock, "homelab", "s3cret")
+			op.setDiscovery(field, "http://auth.example.com/"+field) // a https issuer can still advertise cleartext endpoints
+			if _, err := NewAuth(context.Background(), baseConfig(op, clock)); err == nil {
+				t.Errorf("NewAuth accepted a cleartext %s", field)
+			} else if !strings.Contains(err.Error(), field) {
+				t.Errorf("error should name the offending endpoint: %v", err)
+			}
+		})
+	}
+}
+
+func TestHTTPClient_RefusesInsecureRedirects(t *testing.T) {
+	h := newHarness(t, nil)
+	check := h.auth.httpClient.CheckRedirect
+	if check == nil {
+		t.Fatal("the provider HTTP client follows redirects unchecked")
+	}
+	for target, ok := range map[string]bool{
+		"https://auth.example.com/token": true,
+		"http://127.0.0.1:9/token":       true, // loopback, as for the issuer itself
+		"http://auth.example.com/token":  false,
+		"http://10.0.0.5/token":          false,
+		"ftp://auth.example.com/token":   false,
+	} {
+		u, _ := url.Parse(target)
+		err := check(&http.Request{URL: u}, nil)
+		if (err == nil) != ok {
+			t.Errorf("redirect to %s: err=%v, want ok=%v", target, err, ok)
+		}
+	}
+	if err := check(&http.Request{URL: &url.URL{Scheme: "https", Host: "a.example"}}, make([]*http.Request, 10)); err == nil {
+		t.Error("an endless redirect chain was followed")
+	}
+}
+
+func TestResponses_AreNotFrameableOrCacheable(t *testing.T) {
+	h := newHarness(t, nil)
+	os.MkdirAll(filepath.Join(h.srv.repoRoot, ".deploy-logs"), 0o755)
+	os.WriteFile(filepath.Join(h.srv.repoRoot, ".deploy-logs", "report.html"), []byte("<html>r</html>"), 0o644)
+	cs := []*http.Cookie{h.sessionFor("v", RoleViewer)}
+	for _, r := range []req{
+		{method: "GET", path: "/graph", cookies: cs},
+		{method: "GET", path: "/logs/report.html", cookies: cs},
+		{method: "GET", path: "/graph"},                                         // 401
+		{method: "GET", path: "/auth/login"},                                    // redirect
+		{method: "POST", path: "/run", form: runForm("apply", ""), cookies: cs}, // 403
+	} {
+		rec := h.do(r)
+		hd := rec.Header()
+		if hd.Get("X-Frame-Options") != "DENY" || !strings.Contains(hd.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+			t.Errorf("%s %s (%d): framing not denied: XFO=%q CSP=%q", r.method, r.path, rec.Code, hd.Get("X-Frame-Options"), hd.Get("Content-Security-Policy"))
+		}
+		if !strings.Contains(hd.Get("Cache-Control"), "no-store") {
+			t.Errorf("%s %s (%d): Cache-Control = %q, want no-store", r.method, r.path, rec.Code, hd.Get("Cache-Control"))
+		}
+		if hd.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s %s (%d): missing nosniff", r.method, r.path, rec.Code)
+		}
+	}
+}
+
+func TestLogs_OnlyTheReportsAreServed(t *testing.T) {
+	h := newHarness(t, nil)
+	dir := filepath.Join(h.srv.repoRoot, ".deploy-logs")
+	os.MkdirAll(dir, 0o755)
+	for name, body := range map[string]string{
+		"report.html":       "<html>report</html>",
+		"report.json":       "{}",
+		"services-a.tfplan": "PLAN WITH SECRET VALUES",
+		"notes.txt":         "other",
+	} {
+		os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644)
+	}
+	cs := []*http.Cookie{h.sessionFor("v", RoleViewer)}
+	for path, want := range map[string]int{
+		"/logs/report.html":            200,
+		"/logs/report.json":            200,
+		"/logs/services-a.tfplan":      404, // saved plans can hold unmasked secrets
+		"/logs/notes.txt":              404,
+		"/logs/":                       404, // no directory listing
+		"/logs":                        404,
+		"/logs/..%2Fservices-a.tfplan": 404,
+		"/logs/report.html/..%2Fservices-a.tfplan": 404,
+	} {
+		rec := h.do(req{method: "GET", path: path, cookies: cs})
+		if rec.Code != want {
+			t.Errorf("GET %s = %d, want %d", path, rec.Code, want)
+		}
+		if strings.Contains(rec.Body.String(), "SECRET") || strings.Contains(rec.Body.String(), "services-a") {
+			t.Errorf("GET %s leaked plan data or a listing: %q", path, rec.Body.String())
+		}
+	}
+	if rec := h.do(req{method: "GET", path: "/logs/report.html"}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated report = %d, want 401", rec.Code)
+	}
+}
+
+func TestScopes_ExplicitOpenidOnlyIsHonoured(t *testing.T) {
+	for name, tc := range map[string]struct {
+		scopes []string
+		want   string
+	}{
+		"nothing configured":      {nil, "openid profile"},
+		"blank entries":           {[]string{"", " "}, "openid profile"},
+		"explicit openid only":    {[]string{"openid"}, "openid"},
+		"openid plus groups":      {[]string{"groups"}, "openid groups"},
+		"openid listed with more": {[]string{"openid", "email"}, "openid email"},
+	} {
+		h := newHarness(t, func(c *AuthConfig) { c.Scopes = tc.scopes })
+		if got := strings.Join(h.auth.oauth.Scopes, " "); got != tc.want {
+			t.Errorf("%s: scopes = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+func TestAudit_PathsAreQuotedSoTheyCannotForgeLines(t *testing.T) {
+	h := newHarness(t, nil)
+	buf := captureLog(t)
+	evil := "/jobs/x%0A2026%2F01%2F01%20job%20started:%20id=fake/confirm"
+	h.do(req{method: "POST", path: evil, cookies: []*http.Cookie{h.sessionFor("v", RoleViewer)}})                  // role denial
+	h.do(req{method: "POST", path: evil, cookies: []*http.Cookie{h.sessionFor("a", RoleApplier)}, noOrigin: true}) // cross-origin denial
+	logged := buf.String()
+	if !strings.Contains(logged, "auth denied") {
+		t.Fatalf("expected denial lines in the log:\n%s", logged)
+	}
+	for _, line := range strings.Split(logged, "\n") {
+		if strings.Contains(line, "job started: id=fake") && !strings.Contains(line, `\n`) {
+			t.Errorf("a decoded newline in the path started a fresh log line: %q", line)
+		}
+	}
+}
+
+func TestOrigin_ComparedCanonically(t *testing.T) {
+	h := newHarness(t, func(c *AuthConfig) { c.PublicURL = "HTTPS://Deploy.Example.COM:443" })
+	if h.auth.origin != "https://deploy.example.com" {
+		t.Fatalf("origin = %q, want the canonical https://deploy.example.com", h.auth.origin)
+	}
+	authURL, _, _ := h.startLogin("")
+	if u, _ := url.Parse(authURL); u.Query().Get("redirect_uri") != "https://deploy.example.com/auth/callback" {
+		t.Errorf("redirect_uri = %q, want the canonical origin + /auth/callback", u.Query().Get("redirect_uri"))
+	}
+	cs := []*http.Cookie{h.sessionFor("a", RoleApplier)}
+	for origin, ok := range map[string]bool{
+		"https://deploy.example.com":      true, // how browsers serialize it
+		"https://DEPLOY.example.com":      true,
+		"https://deploy.example.com:443":  true,
+		"https://deploy.example.com:8443": false,
+		"http://deploy.example.com":       false,
+		"https://deploy.example.com/x":    false, // not an origin
+		"https://user@deploy.example.com": false,
+		"null":                            false,
+		"":                                false,
+	} {
+		rec := h.do(req{method: "POST", path: "/run", form: runForm("apply", "nope"), cookies: cs, header: map[string]string{"Origin": origin}, noOrigin: origin == ""})
+		if ok == (rec.Code == http.StatusForbidden) {
+			t.Errorf("Origin %q: status %d, want allowed=%v", origin, rec.Code, ok)
+		}
+	}
+}
+
+func TestCookies_HostPrefixedAndPinnedOnHTTPS(t *testing.T) {
+	h := newHarness(t, func(c *AuthConfig) { c.PublicURL = "https://deploy.example.com" })
+	authURL, state, lc := h.startLogin("")
+	if lc == nil || lc.Name != "__Host-"+loginCookie {
+		t.Fatalf("login cookie = %+v, want name __Host-%s", lc, loginCookie)
+	}
+	res := h.callback(h.op.approve(authURL, nil, ""), state, lc)
+	if res.session == nil || res.session.Name != "__Host-"+sessionCookie {
+		t.Fatalf("session cookie = %+v, want name __Host-%s", res.session, sessionCookie)
+	}
+	// What the __Host- prefix demands of the browser: Secure, Path=/, no Domain.
+	for _, c := range []*http.Cookie{lc, res.session} {
+		if !c.Secure || c.Path != "/" || c.Domain != "" || !c.HttpOnly {
+			t.Errorf("%s: Secure=%v Path=%q Domain=%q HttpOnly=%v, want Secure, Path=/, no Domain, HttpOnly", c.Name, c.Secure, c.Path, c.Domain, c.HttpOnly)
+		}
+	}
+	// A cookie planted under the plain name by a sibling subdomain means nothing.
+	h.auth.sessions.put("planted", Identity{User: "attacker", Role: RoleApplier}, time.Hour)
+	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{{Name: sessionCookie, Value: "planted"}}}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("a plain-named session cookie was honoured on an https deployment: %d", rec.Code)
+	}
+	// Clearing uses the same attributes, or the browser would ignore it.
+	out := h.do(req{method: "POST", path: "/auth/logout", cookies: []*http.Cookie{res.session}, header: map[string]string{"Origin": "https://deploy.example.com"}})
+	if c := cookieNamed(out, "__Host-"+sessionCookie); c == nil || c.MaxAge >= 0 || !c.Secure || c.Path != "/" {
+		t.Errorf("logout cookie = %+v, want an expiring __Host- cookie with Secure and Path=/", c)
+	}
+}
+
+func TestCookies_PlainNamesOnLoopbackHTTP(t *testing.T) {
+	h := newHarness(t, nil)
+	if got := h.auth.cookieName(sessionCookie); got != sessionCookie {
+		t.Errorf("cookie name over http = %q, want the plain %q (browsers reject __Host- without Secure)", got, sessionCookie)
+	}
+}
+
+func TestStore_TakeIsAtomic(t *testing.T) {
+	now := time.Now
+	for round := 0; round < 200; round++ {
+		s := newExpiringStore[int](10, now, false)
+		s.put("k", 1, time.Minute)
+		var wins int32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if _, ok := s.take("k"); ok {
+					atomic.AddInt32(&wins, 1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if wins != 1 {
+			t.Fatalf("round %d: %d concurrent takes succeeded, want exactly 1 (single-use state)", round, wins)
+		}
+	}
+}
+
+func TestStream_EndsWhenTheSessionEnds(t *testing.T) {
+	old := streamRecheck
+	streamRecheck = 20 * time.Millisecond
+	t.Cleanup(func() { streamRecheck = old })
+
+	for _, how := range []string{"logout", "expiry"} {
+		t.Run(how, func(t *testing.T) {
+			h := newHarness(t, func(c *AuthConfig) { c.SessionTTL = time.Hour })
+			h.srv.jobs["j1"] = newJob("j1", "plan", nil, true) // never finishes, so the stream stays open
+			res := h.login("", nil, "")
+			ts := httptest.NewServer(h.srv.Handler())
+			t.Cleanup(ts.Close)
+
+			r, _ := http.NewRequest("GET", ts.URL+"/jobs/j1/stream", nil)
+			r.AddCookie(res.session)
+			resp, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("stream = %d, want 200", resp.StatusCode)
+			}
+			if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+				t.Errorf("stream Cache-Control = %q, want no-store", cc)
+			}
+
+			done := make(chan struct{})
+			go func() { io.Copy(io.Discard, resp.Body); close(done) }()
+			select {
+			case <-done:
+				t.Fatal("stream ended on its own")
+			case <-time.After(100 * time.Millisecond):
+			}
+			if how == "logout" {
+				h.do(req{method: "POST", path: "/auth/logout", cookies: []*http.Cookie{res.session}})
+			} else {
+				h.clock.Advance(2 * time.Hour)
+			}
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("stream kept delivering after the session ended by %s", how)
+			}
+		})
+	}
+}
+
+func TestSessions_FullStoreRefusesRatherThanLoggingSomeoneOut(t *testing.T) {
+	h := newHarness(t, nil)
+	var first *http.Cookie
+	for i := 0; i < maxLiveEntries; i++ {
+		c := h.sessionFor("u", RoleViewer)
+		if i == 0 {
+			first = c
+		}
+		h.clock.Advance(time.Millisecond)
+	}
+	// One more login: refused with 503, and nobody already signed in is dropped.
+	authURL, state, lc := h.startLogin("")
+	res := h.callback(h.op.approve(authURL, nil, ""), state, lc)
+	if res.session != nil || res.rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("login with a full session store = %d session=%v, want 503 and no session", res.rec.Code, res.session)
+	}
+	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{first}}); denied(rec.Code) {
+		t.Errorf("the oldest live session was evicted to make room: %d", rec.Code)
 	}
 }

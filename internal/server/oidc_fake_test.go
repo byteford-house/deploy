@@ -51,8 +51,19 @@ type fakeOP struct {
 	clientID string
 	secret   string // "" = public client: no secret required
 
-	mu    sync.Mutex
-	codes map[string]*opCode
+	mu        sync.Mutex
+	codes     map[string]*opCode
+	discovery map[string]any // overrides merged into the discovery document
+}
+
+// setDiscovery overrides fields of the discovery document (set before NewAuth).
+func (op *fakeOP) setDiscovery(k string, v any) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.discovery == nil {
+		op.discovery = map[string]any{}
+	}
+	op.discovery[k] = v
 }
 
 type opCode struct {
@@ -76,7 +87,7 @@ func newFakeOP(t *testing.T, clock *testClock, clientID, secret string) *fakeOP 
 	op := &fakeOP{t: t, clock: clock, key: k1, otherKey: k2, clientID: clientID, secret: secret, codes: map[string]*opCode{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{
+		doc := map[string]any{
 			"issuer":                                op.srv.URL,
 			"authorization_endpoint":                op.srv.URL + "/authorize",
 			"token_endpoint":                        op.srv.URL + "/token",
@@ -85,7 +96,13 @@ func newFakeOP(t *testing.T, clock *testClock, clientID, secret string) *fakeOP 
 			"subject_types_supported":               []string{"public"},
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 			"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
-		})
+		}
+		op.mu.Lock()
+		for k, v := range op.discovery {
+			doc[k] = v
+		}
+		op.mu.Unlock()
+		writeJSON(w, doc)
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"keys": []map[string]any{{

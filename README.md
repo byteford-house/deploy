@@ -735,12 +735,12 @@ the provider, and back to `/auth/callback`. The server checks the ID
 token (signature against the provider's published keys, issuer, audience
 = your client id, expiry, and the login's nonce), reads the user's
 groups from a claim, and starts a session (an `HttpOnly`,
-`SameSite=Lax` cookie; `Secure` when the public URL is https). Sessions
+`SameSite=Lax` cookie; over https it is `Secure` and named `__Host-hd_session`). Sessions
 are held in memory, so a restart signs everyone out.
 
 | Role | Can |
 |---|---|
-| `viewer` | the dashboard, `/graph`, job pages and their live output (`/jobs/{id}`, `/jobs/{id}/stream`), the static report under `/logs/` |
+| `viewer` | the dashboard, `/graph`, job pages and their live output (`/jobs/{id}`, `/jobs/{id}/stream`), the static report (`/logs/report.html`, `/logs/report.json`; nothing else under `.deploy-logs`) |
 | `planner` | everything a viewer can, plus `plan`, `init` and `sync` runs, and cancelling those jobs |
 | `applier` | everything a planner can, plus `apply` runs, **confirming** an apply (`/jobs/{id}/confirm`), and cancelling an apply job |
 
@@ -756,7 +756,7 @@ Configure it with environment variables:
 | `HOMELAB_DEPLOY_OIDC_ISSUER` | **Required.** The provider's issuer URL, exactly as it appears in the `iss` claim. Must be https (http only for localhost). Authentik uses a per-application issuer: `https://auth.example.com/application/o/<app-slug>/` (keep the trailing slash). |
 | `HOMELAB_DEPLOY_OIDC_CLIENT_ID` | **Required.** |
 | `HOMELAB_DEPLOY_OIDC_CLIENT_SECRET_FILE` | Path to a file containing the client secret (never the secret itself, so it stays out of env and process arguments). Unset = a public client using PKCE alone, if the provider allows it. |
-| `HOMELAB_DEPLOY_PUBLIC_URL` | **Required.** The address browsers use to reach this server, as just `scheme://host[:port]`, e.g. `https://deploy.example.com`. The provider's redirect URI must be registered as this plus `/auth/callback`. Must be https (http only for localhost). |
+| `HOMELAB_DEPLOY_PUBLIC_URL` | **Required.** The address browsers use to reach this server, as just `scheme://host[:port]`, e.g. `https://deploy.example.com`. The provider's redirect URI must be registered as this plus `/auth/callback`, in canonical form: lower-case host, no default port (`https://deploy.example.com/auth/callback`, not `...:443/...`). Must be https (http only for localhost). |
 | `HOMELAB_DEPLOY_VIEWER_GROUPS`, `..._PLANNER_GROUPS`, `..._APPLIER_GROUPS` | Comma-separated group names mapped to each role. At least one must be set. Group names containing a comma cannot be expressed. |
 | `HOMELAB_DEPLOY_OIDC_GROUPS_CLAIM` | ID-token claim holding the groups, default `groups`. A JSON array of strings, or a single string. Nested claims (e.g. Keycloak's `realm_access.roles`) are not supported; use a mapper to emit a top-level claim. |
 | `HOMELAB_DEPLOY_OIDC_USERNAME_CLAIM` | Claim used as the name in logs, default `preferred_username`, then `email`, then `sub`. |
@@ -779,15 +779,37 @@ where `serve` always started open.)
 Other protections:
 
 - A state-changing request (`POST`) must be same-origin: the browser's
-  `Sec-Fetch-Site: same-origin`, or an `Origin` equal to the public URL;
-  with neither it is refused. This is the CSRF defence, since the session
-  cookie is sent automatically.
+  `Sec-Fetch-Site: same-origin`, or an `Origin` equal to the public URL
+  (compared as scheme, lower-cased host and effective port); with neither
+  it is refused. This is the CSRF defence, since the session cookie is
+  sent automatically.
+- Every response sends `X-Frame-Options: DENY`, `frame-ancestors 'none'`
+  and `Cache-Control: no-store`, so the pages (which have Apply buttons)
+  cannot be framed by another site, even a sibling subdomain, or kept by a
+  shared cache.
+- Over https the cookies are `__Host-` prefixed (`Secure`, `Path=/`, no
+  `Domain`), so another service under the same parent domain cannot plant
+  its own session or login state in your browser.
 - The login `state` is bound to the browser by a cookie and is single
-  use; the redirect after login (`next`) can only be a path on this server.
-- Only asymmetric signing algorithms are accepted for ID tokens.
-- The one-time authorization code and state are kept out of the logs.
-- Pending logins and sessions are capped (1000 each) so
-  `/auth/login` cannot be used to exhaust memory.
+  use (checked and consumed atomically); the redirect after login (`next`)
+  can only be a short path on this server, with no backslashes.
+- The discovered authorization, token and JWKS endpoints must be https
+  (loopback excepted), and the HTTP client used for discovery, JWKS and the
+  token exchange refuses redirects to anything else. Only asymmetric
+  signing algorithms are accepted for ID tokens.
+- Group names from the token are matched exactly, with no trimming.
+- Only `report.html` and `report.json` are served from `.deploy-logs`:
+  saved plan files there can contain unmasked secret values.
+- An open job stream ends when its session does (logout or expiry,
+  checked every few seconds), not only at connect time.
+- The one-time authorization code and state are kept out of the logs, and
+  untrusted values in log lines are quoted.
+- Sessions are capped at 1000; at the cap a new login is refused rather
+  than logging someone else out. Pending logins are capped at 1000 too, and
+  when full the oldest abandoned one is dropped, so a flood of
+  `/auth/login` requests cannot lock real users out (it can still churn
+  them; sustained flooding needs rate limiting at the proxy, since the
+  server cannot tell clients apart behind it).
 
 Every run request is logged with the user, kind, directory and outcome
 (`run denied` / `run rejected` / `job started id=...`; the later `job

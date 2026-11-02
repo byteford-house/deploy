@@ -3,10 +3,31 @@ package server
 import (
 	"log"
 	"net/http"
+	"path/filepath"
+	"time"
 
 	"homelab-deploy/internal/graph"
+	"homelab-deploy/internal/orchestrate"
 	"homelab-deploy/internal/report"
 )
+
+// reportFiles are the only files under .deploy-logs served over HTTP. The
+// directory also holds saved terraform plan files (<dir>.tfplan), which can
+// contain unmasked secret values that the rendered reports redact.
+var reportFiles = map[string]bool{"report.html": true, "report.json": true}
+
+func (s *Server) handleReportFile(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !reportFiles[name] {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, filepath.Join(s.repoRoot, orchestrate.LogDir, name))
+}
+
+// streamRecheck is how often an open job stream re-checks that the viewer's
+// session is still valid. A var so tests can shorten it.
+var streamRecheck = 5 * time.Second
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	g, err := s.discoverGraph()
@@ -215,7 +236,7 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
@@ -238,10 +259,20 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
+	recheck := time.NewTicker(streamRecheck)
+	defer recheck.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-recheck.C:
+			// Authentication happened when the stream opened; a long job (or
+			// one paused awaiting confirmation) must not keep streaming to
+			// someone who has since logged out or whose session expired.
+			if !sessionStillValid(ctx) {
+				log.Printf("stream closed: session ended: job=%s", id)
+				return
+			}
 		case frame, ok := <-live:
 			if !ok {
 				return // broadcaster closed: job finished, stream ends

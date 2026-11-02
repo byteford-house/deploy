@@ -11,12 +11,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"path/filepath"
 	"sync"
 
 	"homelab-deploy/internal/graph"
 	"homelab-deploy/internal/manifest"
-	"homelab-deploy/internal/orchestrate"
 	"homelab-deploy/internal/tf"
 )
 
@@ -119,9 +117,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /jobs/{id}/stream", require(RoleViewer, s.handleJobStream))
 	mux.HandleFunc("POST /jobs/{id}/cancel", require(RolePlanner, s.handleCancelJob))
 	mux.HandleFunc("POST /jobs/{id}/confirm", require(RoleApplier, s.handleConfirmJob))
-	logs := http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(s.repoRoot, orchestrate.LogDir))))
-	mux.HandleFunc("GET /logs/", require(RoleViewer, logs.ServeHTTP))
-	return loggingMiddleware(s.auth.wrap(mux))
+	mux.HandleFunc("GET /logs/{name}", require(RoleViewer, s.handleReportFile))
+	return loggingMiddleware(securityHeaders(s.auth.wrap(mux)))
+}
+
+// securityHeaders is applied to every response, including the login pages
+// and errors. Pages here carry an authenticated user's data and forms whose
+// actions apply infrastructure changes, so they must not be framed by another
+// page (clickjacking; a SameSite=Lax session cookie is still sent to a
+// same-site iframe) and must not be kept by a shared cache.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func displayAddr(addr string) string {
