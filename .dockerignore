@@ -1,0 +1,22 @@
+# Secrets and local config must never reach an image layer or the build
+# cache. Docker ignore patterns match only at the context root unless they
+# start with **/ (unlike .gitignore), so every sensitive pattern has it:
+# a nested services/<x>/.env or terraform.tfstate must be excluded too.
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.shared.example
+
+# Run output and checkouts
+**/.deploy-logs
+**/.deploy-repos-checkouts
+**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+
+# Not needed to build
+.git
+.github
+/dist
+/homelab-deploy

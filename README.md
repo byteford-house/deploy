@@ -1060,6 +1060,44 @@ Note the checksum file is published next to the binary, so it detects a
 corrupted download, not a compromised release. Rely on pinning the tag and on
 restricting who can push tags and write to releases for that.
 
+### Container image
+
+The same workflow builds a container image once the release has been
+created (the `image` job runs after `release`; it is a job rather than a
+separate workflow because a release made with `GITHUB_TOKEN` does not
+trigger other workflows). A `v*` tag pushes:
+
+- `ghcr.io/byteford/deploy:<version>` (the tag without the leading `v`)
+- `ghcr.io/byteford/deploy:latest`, except for pre-releases such as `v1.2.3-rc1`
+
+A PR touching `Dockerfile`, `.dockerignore` or `release.yml` builds and
+smoke-tests the image without pushing it.
+
+The image is `alpine` with `homelab-deploy`, `terraform` (the **latest**
+release at build time, copied from `hashicorp/terraform:latest`; pin it in
+the Dockerfile if a newer Terraform ever breaks a run), `git` and an `ssh`
+client (for `sync`). It runs as uid 10001 in `/work`, listens on `:8080`
+and starts `homelab-deploy serve :8080` by default.
+
+```
+docker run --rm -p 8080:8080 -v "$PWD":/work ghcr.io/byteford/deploy:<version>
+```
+
+Things to know:
+
+- Mount the repo to operate on at `/work`, writable by uid 10001
+  (`.deploy-logs/` is written there). Secrets (`.env`, backend credentials,
+  an SSH key for `sync`) come in at run time as environment variables or
+  mounted files; the build context's `.env*` files are excluded by
+  `.dockerignore` and never enter a layer.
+- The binary is built from the tagged commit with the release workflow's
+  flags, but it is a separate build from the release tarball, not that
+  file.
+- `latest` is a moving tag and so is the Terraform inside it. Pin the
+  version tag when deploying.
+- A package pushed to ghcr.io starts private; making it public (or giving
+  the puller a token) is a package setting on GitHub.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push/PR to `main`: build, `go
