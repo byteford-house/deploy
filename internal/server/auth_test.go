@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -696,8 +697,8 @@ func TestAudit_NamesUserKindDirAndOutcome(t *testing.T) {
 	h.do(req{method: "POST", path: "/run", form: runForm("plan", "nope"), cookies: []*http.Cookie{h.sessionFor("bob", RolePlanner)}})
 	logged := buf.String()
 	for _, want := range []string{
-		`user="alice"`, `kind=apply`, `dir="services/a"`, `denied`,
-		`user="bob"`, `kind=plan`, `dir="nope"`, `rejected`,
+		`user="alice"`, `sub="sub-alice"`, `kind=apply`, `dir="services/a"`, `denied`,
+		`user="bob"`, `sub="sub-bob"`, `kind=plan`, `dir="nope"`, `rejected`,
 	} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("audit log missing %q:\n%s", want, logged)
@@ -723,7 +724,7 @@ func TestAudit_LoginAndDenialsAreLogged(t *testing.T) {
 	h.login("", func(c map[string]any) { c["groups"] = []string{"random"} }, "")
 	h.do(req{method: "POST", path: "/run", form: runForm("apply", ""), cookies: []*http.Cookie{h.sessionFor("v", RoleViewer)}})
 	logged := buf.String()
-	for _, want := range []string{`login: user="alice" sub="sub-alice" role=applier`, "login denied", "no group mapped", `auth denied: user="v" role=viewer needs planner`} {
+	for _, want := range []string{`login: user="alice" sub="sub-alice" role=applier`, "login denied", "no group mapped", `auth denied: user="v" sub="sub-v" role=viewer needs planner`} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("log missing %q:\n%s", want, logged)
 		}
@@ -1225,7 +1226,7 @@ func TestSessions_FullStoreRefusesRatherThanLoggingSomeoneOut(t *testing.T) {
 	h := newHarness(t, nil)
 	var first *http.Cookie
 	for i := 0; i < maxLiveEntries; i++ {
-		c := h.sessionFor("u", RoleViewer)
+		c := h.sessionFor("u"+strconv.Itoa(i), RoleViewer)
 		if i == 0 {
 			first = c
 		}
@@ -1239,5 +1240,166 @@ func TestSessions_FullStoreRefusesRatherThanLoggingSomeoneOut(t *testing.T) {
 	}
 	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{first}}); denied(rec.Code) {
 		t.Errorf("the oldest live session was evicted to make room: %d", rec.Code)
+	}
+}
+
+// ---- review round 2 -------------------------------------------------------------
+
+func TestAudit_EveryActionNamesTheStableSubject(t *testing.T) {
+	// preferred_username is a display claim: not unique, not immutable. The
+	// provider's subject is what distinguishes two accounts with one name.
+	h := newHarness(t, nil)
+	h.srv.jobs["plan1"] = newJob("plan1", "plan", nil, true)
+	h.srv.jobs["apply1"] = newJob("apply1", "apply", nil, true)
+	buf := captureLog(t)
+	planner := []*http.Cookie{h.sessionFor("sam", RolePlanner)}
+	applier := []*http.Cookie{h.sessionFor("sam", RoleApplier)}
+	// A second account with the same display name but a different subject.
+	h.auth.sessions.put("other", Identity{User: "sam", Subject: "sub-OTHER-sam", Role: RoleApplier}, time.Hour)
+	other := []*http.Cookie{{Name: h.auth.cookieName(sessionCookie), Value: "other"}}
+
+	h.do(req{method: "POST", path: "/run", form: runForm("apply", "nope"), cookies: planner})                                 // run requested + denied
+	h.do(req{method: "POST", path: "/run", form: runForm("plan", "nope"), cookies: planner})                                  // run rejected
+	h.do(req{method: "POST", path: "/jobs/apply1/cancel", cookies: planner})                                                  // cancel denied
+	h.do(req{method: "POST", path: "/jobs/plan1/cancel", cookies: planner})                                                   // cancel requested
+	h.do(req{method: "POST", path: "/jobs/apply1/confirm", form: url.Values{"dir": {"a"}}, cookies: applier})                 // apply confirmation ignored
+	h.do(req{method: "POST", path: "/jobs/apply1/confirm", form: url.Values{"dir": {"a"}}, cookies: other})                   // ... by a different "sam"
+	h.do(req{method: "POST", path: "/jobs/apply1/confirm", form: url.Values{"dir": {"a"}}, cookies: planner})                 // role denial
+	h.do(req{method: "POST", path: "/jobs/apply1/confirm", form: url.Values{"dir": {"a"}}, cookies: applier, noOrigin: true}) // cross-origin denial
+
+	logged := buf.String()
+	for _, line := range strings.Split(logged, "\n") {
+		if strings.Contains(line, `user="sam"`) && !strings.Contains(line, `sub="sub-`) {
+			t.Errorf("a line names the user but not the subject: %s", line)
+		}
+	}
+	for _, want := range []string{
+		"run requested", "run denied", "run rejected", "cancel denied", "job cancel requested", "apply confirmation ignored", "auth denied", "cross-origin",
+		`sub="sub-OTHER-sam"`, // the two accounts called "sam" are told apart
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log missing %q:\n%s", want, logged)
+		}
+	}
+}
+
+func TestLogin_ReplacesThePresentedSession(t *testing.T) {
+	h := newHarness(t, nil)
+	first := h.login("", nil, "")
+	if first.session == nil {
+		t.Fatal("first login failed")
+	}
+	// Log in again from the same browser: it presents its current session.
+	authURL, state, lc := h.startLogin("")
+	second := h.callback(h.op.approve(authURL, nil, ""), state, lc, first.session)
+	if second.session == nil {
+		t.Fatalf("second login failed: %d", second.rec.Code)
+	}
+	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{first.session}}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("the replaced session still works: %d, want 401", rec.Code)
+	}
+	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{second.session}}); denied(rec.Code) {
+		t.Errorf("the new session does not work: %d", rec.Code)
+	}
+}
+
+func TestLogin_ReplacementWorksEvenWhenTheStoreIsFull(t *testing.T) {
+	h := newHarness(t, nil)
+	mine := h.sessionFor("me", RoleApplier)
+	for i := 0; i < maxLiveEntries-1; i++ {
+		h.sessionFor("u"+strconv.Itoa(i), RoleViewer)
+	}
+	authURL, state, lc := h.startLogin("")
+	res := h.callback(h.op.approve(authURL, nil, ""), state, lc, mine)
+	if res.session == nil {
+		t.Errorf("re-login at capacity = %d, want the presented session replaced, not 503", res.rec.Code)
+	}
+	if n := len(h.auth.sessions.m); n > maxLiveEntries {
+		t.Errorf("%d sessions, cap is %d", n, maxLiveEntries)
+	}
+}
+
+func TestSessions_OneAccountCannotFillTheStore(t *testing.T) {
+	h := newHarness(t, nil)
+	var cookies []*http.Cookie
+	for i := 0; i < maxSessionsPerSubject+4; i++ {
+		res := h.login("", nil, "") // alice, never presenting an old session
+		if res.session == nil {
+			t.Fatalf("login %d failed: %d", i, res.rec.Code)
+		}
+		cookies = append(cookies, res.session)
+		h.clock.Advance(time.Second)
+	}
+	live := 0
+	for i, c := range cookies {
+		ok := !denied(h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{c}}).Code)
+		if ok {
+			live++
+		}
+		if i < 4 && ok {
+			t.Errorf("session %d (older than the newest %d) still works", i, maxSessionsPerSubject)
+		}
+	}
+	if live != maxSessionsPerSubject {
+		t.Errorf("%d live sessions for one account, want exactly %d (the newest)", live, maxSessionsPerSubject)
+	}
+	// And other people are untouched.
+	bob := h.sessionFor("bob", RoleViewer)
+	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{bob}}); denied(rec.Code) {
+		t.Errorf("another account's session was affected: %d", rec.Code)
+	}
+}
+
+func TestCallback_MismatchedStateDoesNotDestroyAnotherLoginInProgress(t *testing.T) {
+	h := newHarness(t, nil)
+	authA, stateA, _ := h.startLogin("")       // tab 1 starts...
+	authB, stateB, cookieB := h.startLogin("") // ...tab 2 starts; the browser now holds tab 2's cookie
+	codeA, codeB := h.op.approve(authA, nil, ""), h.op.approve(authB, nil, "")
+
+	// Tab 1's callback arrives carrying tab 2's cookie: it must fail without clearing it.
+	stale := h.callback(codeA, stateA, cookieB)
+	if stale.session != nil || stale.rec.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched callback = %d session=%v, want 400 and no session", stale.rec.Code, stale.session)
+	}
+	if c := cookieNamed(stale.rec, h.auth.cookieName(loginCookie)); c != nil {
+		t.Errorf("a mismatched callback touched the login cookie: %+v", c)
+	}
+	// Tab 2's login still completes.
+	if res := h.callback(codeB, stateB, cookieB); res.session == nil {
+		t.Errorf("tab 2's login was destroyed by tab 1's stale callback: %d", res.rec.Code)
+	}
+	// A matching callback does consume the cookie.
+	authC, stateC, cookieC := h.startLogin("")
+	done := h.callback(h.op.approve(authC, nil, ""), stateC, cookieC)
+	if c := cookieNamed(done.rec, h.auth.cookieName(loginCookie)); c == nil || c.MaxAge >= 0 {
+		t.Errorf("a completed login should clear the login cookie, got %+v", c)
+	}
+}
+
+func TestLogin_NoLongerInAnyGroupRevokesExistingSessions(t *testing.T) {
+	h := newHarness(t, nil)
+	laptop := h.login("", nil, "") // alice, applier
+	phone := h.login("", nil, "")  // a second device
+	bob := h.login("", func(c map[string]any) { c["sub"] = "sub-bob"; c["preferred_username"] = "bob" }, "")
+	if laptop.session == nil || phone.session == nil || bob.session == nil {
+		t.Fatal("setup logins failed")
+	}
+
+	// Alice is removed from every mapped group, then tries to sign in again from the laptop.
+	authURL, state, lc := h.startLogin("")
+	res := h.callback(h.op.approve(authURL, func(c map[string]any) { c["groups"] = []string{} }, ""), state, lc, laptop.session)
+	if res.rec.Code != http.StatusForbidden || res.session != nil {
+		t.Fatalf("re-login = %d, want 403 and no session", res.rec.Code)
+	}
+	if c := cookieNamed(res.rec, h.auth.cookieName(sessionCookie)); c == nil || c.MaxAge >= 0 {
+		t.Errorf("the browser's session cookie should be cleared, got %+v", c)
+	}
+	for name, c := range map[string]*http.Cookie{"laptop": laptop.session, "phone": phone.session} {
+		if rec := h.do(req{method: "POST", path: "/run", form: runForm("apply", "nope"), cookies: []*http.Cookie{c}}); rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: alice's old session still authorizes /run after losing her groups: %d", name, rec.Code)
+		}
+	}
+	if rec := h.do(req{method: "GET", path: "/graph", cookies: []*http.Cookie{bob.session}}); denied(rec.Code) {
+		t.Errorf("another account's session was revoked: %d", rec.Code)
 	}
 }

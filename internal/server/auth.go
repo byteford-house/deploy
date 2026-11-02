@@ -64,6 +64,8 @@ const (
 	loginStateTTL     = 10 * time.Minute
 	maxLiveEntries    = 1000 // cap on pending logins and on sessions, so unauthenticated /auth/login cannot grow memory without bound
 
+	maxSessionsPerSubject = 5 // concurrent sessions one account may hold (a few devices); the oldest is dropped past this
+
 	maxNextLen = 512 // longest post-login return path kept; stops 1000 pending logins retaining ~1 MiB each
 
 	// Cookie base names. Over https they are prefixed "__Host-", which
@@ -422,7 +424,7 @@ func (a *Auth) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !safeMethod(r.Method) && !a.sameOrigin(r) {
-			log.Printf("auth denied: user=%q cross-origin %s %q (Origin=%q Sec-Fetch-Site=%q)", id.User, r.Method, r.URL.Path, r.Header.Get("Origin"), r.Header.Get("Sec-Fetch-Site"))
+			log.Printf("auth denied: user=%q sub=%q cross-origin %s %q (Origin=%q Sec-Fetch-Site=%q)", id.User, id.Subject, r.Method, r.URL.Path, r.Header.Get("Origin"), r.Header.Get("Sec-Fetch-Site"))
 			http.Error(w, "forbidden: cross-origin request", http.StatusForbidden)
 			return
 		}
@@ -491,14 +493,16 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	state := q.Get("state")
 
-	// The login cookie and pending state are single use, whatever happens next.
 	c, cerr := r.Cookie(a.cookieName(loginCookie))
-	a.setCookie(w, loginCookie, "", -1)
 	if cerr != nil || state == "" || subtle.ConstantTimeCompare([]byte(c.Value), []byte(state)) != 1 {
+		// Left alone on purpose: the cookie belongs to a different login the
+		// browser started since (another tab), which this stale callback must not destroy.
 		log.Printf("login failed: state cookie missing or mismatched (from %s)", r.RemoteAddr)
 		http.Error(w, "login failed: start again at /auth/login", http.StatusBadRequest)
 		return
 	}
+	// This callback owns the cookie: it, and the pending state, are single use whatever happens next.
+	a.setCookie(w, loginCookie, "", -1)
 	p, ok := a.pending.take(state)
 	if !ok {
 		log.Printf("login failed: unknown, expired or replayed state (from %s)", r.RemoteAddr)
@@ -550,13 +554,27 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 	user := a.username(claims, idt.Subject)
 	role := a.roleFor(claimStrings(claims[a.groupsClaim]))
 	if role == RoleNone {
-		log.Printf("login denied: user=%q sub=%q is in no group mapped to a role (claim %q)", user, idt.Subject, a.groupsClaim)
+		// The provider no longer grants this account any role: end every
+		// session it holds (this browser's and other devices'), so a group
+		// removal takes effect at the next login attempt instead of at
+		// each old session's expiry.
+		n := a.sessions.deleteWhere(func(i Identity) bool { return i.Subject == idt.Subject })
+		a.setCookie(w, sessionCookie, "", -1)
+		log.Printf("login denied: user=%q sub=%q is in no group mapped to a role (claim %q); revoked %d session(s)", user, idt.Subject, a.groupsClaim, n)
 		http.Error(w, "forbidden: your account is not in any group allowed to use this server", http.StatusForbidden)
 		return
 	}
 
+	// A new login replaces the session this browser presented (so re-login
+	// really drops the old privileges and uses no extra slot), and one account
+	// holds at most maxSessionsPerSubject, so it cannot fill the store alone.
+	presented := ""
+	if pc, err := r.Cookie(a.cookieName(sessionCookie)); err == nil {
+		presented = pc.Value
+	}
 	sid := randToken()
-	if !a.sessions.put(sid, Identity{User: user, Subject: idt.Subject, Role: role}, a.ttl) {
+	if !a.sessions.replace(presented, sid, Identity{User: user, Subject: idt.Subject, Role: role}, a.ttl,
+		func(i Identity) bool { return i.Subject == idt.Subject }, maxSessionsPerSubject) {
 		http.Error(w, "too many sessions, try again shortly", http.StatusServiceUnavailable)
 		return
 	}
@@ -570,7 +588,8 @@ func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
 		a.sessions.delete(c.Value)
 	}
 	a.setCookie(w, sessionCookie, "", -1)
-	log.Printf("logout: user=%q", identityFrom(r.Context()).User)
+	who := identityFrom(r.Context())
+	log.Printf("logout: user=%q sub=%q", who.User, who.Subject)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!doctype html><title>Signed out</title><p>Signed out. <a href="/auth/login">Sign in again</a></p>`)
 }
@@ -669,9 +688,41 @@ func newExpiringStore[T any](max int, now func() time.Time, evictOldest bool) *e
 // put stores v, first dropping lapsed entries. When the store is still full
 // it evicts the oldest entry (evictOldest) or reports false.
 func (s *expiringStore[T]) put(key string, v T, ttl time.Duration) bool {
+	return s.replace("", key, v, ttl, nil, 0)
+}
+
+// replace atomically removes the entry at old (if any), keeps at most
+// perGroup live entries for which same reports true by dropping the oldest of
+// them, then stores v as put does. Removing old first means swapping one's own
+// entry never needs a free slot.
+func (s *expiringStore[T]) replace(old, key string, v T, ttl time.Duration, same func(T) bool, perGroup int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
+	if old != "" {
+		delete(s.m, old)
+	}
+	if same != nil && perGroup > 0 {
+		for {
+			n, oldest, oldestExp := 0, "", time.Time{}
+			for k, e := range s.m {
+				if !now.Before(e.exp) {
+					delete(s.m, k)
+					continue
+				}
+				if same(e.v) {
+					n++
+					if oldest == "" || e.exp.Before(oldestExp) {
+						oldest, oldestExp = k, e.exp
+					}
+				}
+			}
+			if n < perGroup {
+				break
+			}
+			delete(s.m, oldest)
+		}
+	}
 	if len(s.m) >= s.max {
 		for k, e := range s.m {
 			if !now.Before(e.exp) {
@@ -694,6 +745,20 @@ func (s *expiringStore[T]) put(key string, v T, ttl time.Duration) bool {
 	}
 	s.m[key] = storeEntry[T]{v: v, exp: now.Add(ttl)}
 	return true
+}
+
+// deleteWhere removes every entry for which match is true and returns how many.
+func (s *expiringStore[T]) deleteWhere(match func(T) bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k, e := range s.m {
+		if match(e.v) {
+			delete(s.m, k)
+			n++
+		}
+	}
+	return n
 }
 
 func (s *expiringStore[T]) get(key string) (T, bool) {
@@ -731,7 +796,7 @@ func (s *expiringStore[T]) delete(key string) {
 func require(min Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if id := identityFrom(r.Context()); id.Role < min {
-			log.Printf("auth denied: user=%q role=%s needs %s for %s %q", id.User, id.Role, min, r.Method, r.URL.Path)
+			log.Printf("auth denied: user=%q sub=%q role=%s needs %s for %s %q", id.User, id.Subject, id.Role, min, r.Method, r.URL.Path)
 			http.Error(w, "forbidden: requires the "+min.String()+" role", http.StatusForbidden)
 			return
 		}
@@ -740,8 +805,11 @@ func require(min Role, next http.HandlerFunc) http.HandlerFunc {
 }
 
 // roleForKind is the role a run of this kind needs. Only apply changes
-// real infrastructure; plan is read-only, init and sync touch local
-// state/checkouts only.
+// real infrastructure through this tool; plan, init and sync do not. That
+// is a statement about what the buttons do, not a sandbox: terraform
+// executes provider and data-source code at plan time with the server's own
+// credentials, so a planner (or anyone who can change the repository that
+// gets planned) is trusted to that extent. See the README.
 func roleForKind(kind string) Role {
 	if kind == "apply" {
 		return RoleApplier

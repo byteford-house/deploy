@@ -122,12 +122,12 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 	if dirLog == "" {
 		dirLog = "(all)"
 	}
-	log.Printf("run requested: user=%q kind=%s dir=%q from=%s", id.User, kind, dirLog, r.RemoteAddr)
+	log.Printf("run requested: user=%q sub=%q kind=%s dir=%q from=%s", id.User, id.Subject, kind, dirLog, r.RemoteAddr)
 
 	// The kind checked here is the very value used below: one read of
 	// the form, so the gate and the runner cannot disagree about it.
 	if need := roleForKind(kind); id.Role < need {
-		log.Printf("run denied: user=%q role=%s kind=%s dir=%q needs %s", id.User, id.Role, kind, dirLog, need)
+		log.Printf("run denied: user=%q sub=%q role=%s kind=%s dir=%q needs %s", id.User, id.Subject, id.Role, kind, dirLog, need)
 		http.Error(w, "forbidden: "+kind+" requires the "+need.String()+" role", http.StatusForbidden)
 		return
 	}
@@ -138,11 +138,11 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 		// requested — either way this is the person's next useful
 		// signal, not a 500.
 		// err can embed the client-supplied dir ("unknown directory: ..."), so it is quoted too.
-		log.Printf("run rejected: user=%q kind=%s dir=%q: %q", id.User, kind, dirLog, err.Error())
+		log.Printf("run rejected: user=%q sub=%q kind=%s dir=%q: %q", id.User, id.Subject, kind, dirLog, err.Error())
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	log.Printf("job started: id=%s user=%q kind=%s dirs=%q", job.ID, id.User, job.Kind, job.Dirs)
+	log.Printf("job started: id=%s user=%q sub=%q kind=%s dirs=%q", job.ID, id.User, id.Subject, job.Kind, job.Dirs)
 
 	// Redirect back to the dashboard, not the job page — the dashboard
 	// itself shows a live progress bar (via the same SSE stream the job
@@ -183,14 +183,14 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	// takes the same role as starting one.
 	who := identityFrom(r.Context())
 	if need := roleForKind(job.Kind); who.Role < need {
-		log.Printf("cancel denied: user=%q role=%s id=%s kind=%s needs %s", who.User, who.Role, id, job.Kind, need)
+		log.Printf("cancel denied: user=%q sub=%q role=%s id=%s kind=%s needs %s", who.User, who.Subject, who.Role, id, job.Kind, need)
 		http.Error(w, "forbidden: cancelling a "+job.Kind+" job requires the "+need.String()+" role", http.StatusForbidden)
 		return
 	}
 	if job.Cancel() {
-		log.Printf("job cancel requested: id=%s user=%q kind=%s from=%s", id, who.User, job.Kind, r.RemoteAddr)
+		log.Printf("job cancel requested: id=%s user=%q sub=%q kind=%s from=%s", id, who.User, who.Subject, job.Kind, r.RemoteAddr)
 	} else {
-		log.Printf("job cancel requested but already finished: id=%s user=%q from=%s", id, who.User, r.RemoteAddr)
+		log.Printf("job cancel requested but already finished: id=%s user=%q sub=%q from=%s", id, who.User, who.Subject, r.RemoteAddr)
 	}
 	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
 }
@@ -212,11 +212,11 @@ func (s *Server) handleConfirmJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := r.FormValue("dir")
-	who := identityFrom(r.Context()).User
+	who := identityFrom(r.Context())
 	if job.Confirm(dir) {
-		log.Printf("apply confirmed: id=%s user=%q dir=%q from=%s", id, who, dir, r.RemoteAddr)
+		log.Printf("apply confirmed: id=%s user=%q sub=%q dir=%q from=%s", id, who.User, who.Subject, dir, r.RemoteAddr)
 	} else {
-		log.Printf("apply confirmation ignored (nothing pending for dir): id=%s user=%q dir=%q from=%s", id, who, dir, r.RemoteAddr)
+		log.Printf("apply confirmation ignored (nothing pending for dir): id=%s user=%q sub=%q dir=%q from=%s", id, who.User, who.Subject, dir, r.RemoteAddr)
 	}
 	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
 }
@@ -244,9 +244,9 @@ func (s *Server) handleJobStream(w http.ResponseWriter, r *http.Request) {
 	// (potentially long-lived) connection closes — log the connect/
 	// disconnect separately so a stream that's open for minutes doesn't
 	// look like nothing is happening.
-	who := identityFrom(r.Context()).User
-	log.Printf("stream connected: job=%s user=%q from=%s", id, who, r.RemoteAddr)
-	defer log.Printf("stream disconnected: job=%s user=%q from=%s", id, who, r.RemoteAddr)
+	who := identityFrom(r.Context())
+	log.Printf("stream connected: job=%s user=%q sub=%q from=%s", id, who.User, who.Subject, r.RemoteAddr)
+	defer log.Printf("stream disconnected: job=%s user=%q sub=%q from=%s", id, who.User, who.Subject, r.RemoteAddr)
 
 	replay, live := job.broadcaster.Subscribe()
 	defer job.broadcaster.Unsubscribe(live)

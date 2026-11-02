@@ -745,9 +745,24 @@ are held in memory, so a restart signs everyone out.
 | `applier` | everything a planner can, plus `apply` runs, **confirming** an apply (`/jobs/{id}/confirm`), and cancelling an apply job |
 
 Roles are cumulative. A user's role is the highest one any of their
-groups maps to; groups are matched exactly (case-sensitive). Roles are
-read **at login**, so a group change takes effect the next time the user
-signs in (or when their session expires).
+groups maps to; groups are matched exactly (case-sensitive, untrimmed).
+Roles are read **at login**, so a group change takes effect the next time
+the user signs in, or when their session expires (`HOMELAB_DEPLOY_SESSION_TTL`
+is the upper bound; shorten it if that is too long). If a user who has lost
+all their groups tries to sign in, every session that account holds is
+revoked immediately.
+
+**The planner role is not a sandbox.** It limits what the buttons do, not
+what Terraform does. `plan` and `apply` use the same runner and the same
+credentials, and Terraform runs provider and data-source code (for example
+an `external` data source) at plan time, and `init` downloads providers and
+modules. Anyone who can change the repository being planned, or the repos
+`sync` pulls, can therefore run code with this server's credentials through
+a planner's `plan`/`init`/`sync`, without ever holding the applier role. Give
+`planner` only to people you would trust with that, and treat write access
+to the repos as equivalent to apply access. If that is not acceptable, the
+fix is separate read-only credentials for planning, which this server does
+not do.
 
 Configure it with environment variables:
 
@@ -775,6 +790,15 @@ discovery document cannot be fetched. `--insecure-no-auth` is the only
 way to run without auth; it logs a warning and is refused if any of the
 variables above are also set. (This is a change from earlier versions,
 where `serve` always started open.)
+
+**Transport.** The server itself speaks plain HTTP (`http.ListenAndServe`)
+and relies on a TLS-terminating reverse proxy for https. The `Secure` cookie
+flag only protects the browser-to-proxy leg. The proxy-to-server connection
+must therefore be local to the host or otherwise encrypted and private (a
+loopback or private container network at least): anything that can read it
+sees session cookies, which can be replayed until they expire. Likewise
+`HOMELAB_DEPLOY_PUBLIC_URL` must be the https address the browser uses, or
+the cookies lose `Secure` and the `__Host-` prefix.
 
 Other protections:
 
@@ -804,13 +828,22 @@ Other protections:
   checked every few seconds), not only at connect time.
 - The one-time authorization code and state are kept out of the logs, and
   untrusted values in log lines are quoted.
-- Sessions are capped at 1000; at the cap a new login is refused rather
-  than logging someone else out. Pending logins are capped at 1000 too, and
+- A new login replaces the session the browser presented, so re-login
+  really drops the old privileges. One account holds at most 5 sessions
+  (a few devices; the oldest is dropped), so a single account cannot fill
+  the store. Sessions are capped at 1000 overall; at the cap a new login is
+  refused rather than logging someone else out.
+- Two logins started in different tabs share one login cookie: the second
+  start replaces the first, and the first tab's callback then fails and
+  has to be restarted. A stale callback never destroys the other login. Pending logins are capped at 1000 too, and
   when full the oldest abandoned one is dropped, so a flood of
   `/auth/login` requests cannot lock real users out (it can still churn
   them; sustained flooding needs rate limiting at the proxy, since the
   server cannot tell clients apart behind it).
 
+Every action is logged with `user` (the display claim, which providers
+do not guarantee to be unique or permanent) **and `sub`**, the provider's
+stable subject id, so two accounts with the same name can be told apart.
 Every run request is logged with the user, kind, directory and outcome
 (`run denied` / `run rejected` / `job started id=...`; the later `job
 finished id=...` line carries the same id), plus logins, denied logins
