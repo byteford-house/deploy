@@ -49,12 +49,11 @@ const maxJobHistory = 50
 // (services/, config/, infra/ live under it, or a .deploy-repos
 // manifest — see internal/manifest — for multi-repo mode). auth is
 // required: see Auth for how a request's identity and role are decided.
-func Serve(repoRoot, addr string, auth *Auth) error {
-	runner, err := tf.NewRunner()
-	if err != nil {
-		return err
-	}
-	s, err := newServer(repoRoot, runner, auth)
+// backend is the merged [backend] section from the env files: the runner
+// passes it as -backend-config when it inits a directory that has the
+// generated backend stub (see tf.Runner.Init), exactly as the CLI does.
+func Serve(repoRoot, addr string, auth *Auth, backend tf.BackendConfig) error {
+	s, err := buildServer(repoRoot, auth, backend)
 	if err != nil {
 		return err
 	}
@@ -65,6 +64,18 @@ func Serve(repoRoot, addr string, auth *Auth) error {
 		log.Println("WARNING: running with --insecure-no-auth — anyone who can reach this port can plan AND apply")
 	}
 	return http.ListenAndServe(addr, s.Handler())
+}
+
+// buildServer is Serve minus the listener: it creates the terraform
+// runner Serve uses and wraps it in a Server. Split out so a test can
+// check what that runner will do without binding a port.
+func buildServer(repoRoot string, auth *Auth, backend tf.BackendConfig) (*Server, error) {
+	runner, err := tf.NewRunner()
+	if err != nil {
+		return nil, err
+	}
+	runner.SetBackend(backend)
+	return newServer(repoRoot, runner, auth)
 }
 
 // newServer builds a Server without starting to listen — split out from

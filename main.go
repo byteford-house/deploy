@@ -224,7 +224,7 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("serve: %w", err)
 		}
-		return server.Serve(repoRoot, addr, auth)
+		return server.Serve(repoRoot, addr, auth, backend)
 	default:
 		info, statErr := os.Stat(filepath.Join(repoRoot, remaining[0]))
 		if err := classifyDirArg(remaining[0], info, statErr); err != nil {
@@ -264,7 +264,7 @@ func newRunner(resolver *manifest.Resolver) (*tf.Runner, error) {
 // `init` can pass -backend-config to already-migrated directories (see
 // tf.Runner.Init). Zero value (the default, and what tests see) means
 // "pass nothing", which is the previous behavior. The web server builds
-// its own Runner and does not use this.
+// its own Runner; run() hands it the same settings (see the "serve" case).
 var cliBackend tf.BackendConfig
 
 // cmdSync clones any not-yet-checked-out git entry in .deploy-repos and
