@@ -248,7 +248,9 @@ render correctly across all three entries together.
 
 `homelab-deploy init --migrate-backend` migrates a directory (or every
 not-yet-migrated directory at once) from local state to whatever
-`[backend]` your `.env.shared` (or `.env`) configures.
+`[backend]` your `.env.shared` (or `.env`) configures. The same `[backend]`
+settings are passed as `-backend-config` whenever `init` runs for a
+directory that has `deploy_backend.tf`, including from the `serve` dashboard.
 
 **The hard constraint this works within.** Terraform requires a
 backend's *type* to be declared as a literal block physically inside
