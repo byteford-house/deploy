@@ -682,6 +682,111 @@ endpoints={ s3 = "https://<account id>.r2.cloudflarestorage.com" }
   Credentials stay out of git: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in
   `.env`'s `[env]` section or the CI environment.
 
+### GitHub Actions recipe
+
+A plan check on pull requests, plus a scheduled drift check, using only what
+this tool already does. **The workflow YAML below has not been run in
+GitHub Actions** (it is an example to adapt, not a tested artifact); the
+behaviour it relies on, listed under it, is covered by tests in this repo.
+
+```yaml
+name: terraform-plan
+on:
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"        # drift check
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest      # or your self-hosted runner
+    steps:
+      - uses: actions/checkout@v7
+
+      # terraform_wrapper must be false: the wrapper script captures
+      # stdout/stderr and breaks terraform-exec (same setting as ci.yml).
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+
+      - name: Install homelab-deploy (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          TAG=v0.2.1
+          BASE="https://github.com/byteford-house/deploy/releases/download/$TAG"
+          curl -fsSLO "$BASE/homelab-deploy_${TAG}_linux_amd64.tar.gz"
+          curl -fsSLO "$BASE/SHA256SUMS"
+          sha256sum -c SHA256SUMS
+          tar -xzf "homelab-deploy_${TAG}_linux_amd64.tar.gz" homelab-deploy
+          sudo install homelab-deploy /usr/local/bin/homelab-deploy
+
+      - name: Plan
+        id: plan
+        env:                                  # secrets via the environment, no file on disk
+          TF_VAR_authentik_token: ${{ secrets.AUTHENTIK_TOKEN }}   # a [tfvars] entry: TF_VAR_<name>
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}       # an [env] entry: used as-is (R2 state)
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set +e                              # exit 2 means "changes", not "broken"
+          homelab-deploy --non-interactive init
+          homelab-deploy --non-interactive --detailed-exitcode \
+            --summary-md plan-summary.md plan
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          [ "$code" -le 2 ] || exit "$code"   # 1 (or anything else) fails the job
+
+      - name: Fail a scheduled run on drift
+        if: github.event_name == 'schedule' && steps.plan.outputs.code == '2'
+        run: |
+          echo "Drift detected" >> "$GITHUB_STEP_SUMMARY"
+          cat plan-summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Upload the report (not the plan files)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-report
+          path: |
+            .deploy-logs/report.html
+            .deploy-logs/report.json
+```
+
+How the pieces map to what the tool does:
+
+- **Config.** `[backend]` settings come from the committed `.env.shared`. For
+  secrets, exporting `TF_VAR_<name>` and the provider's own variables (such as
+  `AWS_ACCESS_KEY_ID` for R2 state) in the step's `env:` is the simplest and
+  leaves nothing on disk; terraform inherits them. If you do write a `.env`
+  instead: `[tfvars]` entries become `TF_VAR_<name>`, `[env]` entries are set
+  literally, and **a `.env` entry overrides an exported variable of the same
+  name**. Values are one line only, and a value that begins and ends with the
+  same quote character has that pair stripped.
+- **Init before plan.** Run `init` first (all directories, or `<dir> init` for
+  just the ones you are about to plan). `<dir> plan` refuses a directory that
+  has not been initialised ("has not been terraform-initialized yet") and
+  `apply` reports "not initialized — run init first"; a full `plan` does not
+  check and leaves it to terraform to fail for that directory.
+  A directory with the generated `deploy_backend.tf` stub is initialised
+  with the `[backend]` settings, so a fresh runner works.
+- **Exit codes and the summary** are those described under "Exit codes and CI
+  output": `0` clean, `2` changes (with `--detailed-exitcode`), `1` error.
+  `--summary-md` is safe to paste into a PR comment; `report.json` and the
+  raw output are not.
+- **Artifacts.** Upload `report.html` / `report.json` only. `.deploy-logs/`
+  also holds the saved binary plan files (`*.tfplan`), which can contain
+  plan-time secrets, and artifacts are readable by anyone who can read the
+  repository (everyone, for a public one).
+- **Apply from CI.** Always pass `--non-interactive`. Pinned by tests: with an
+  unsatisfied `.manual-before` (its `.manual-check` missing or failing),
+  `apply` **stops the whole run at that directory**: it does not skip just its
+  dependents and carry on, nothing after it is applied (dependents and
+  unrelated directories alike), directories ordered before it have already
+  been applied, `report.json` records the stop, and the exit code is **1**.
+  `<dir> apply` on such a directory refuses the same way, exit 1. A manual
+  step whose `.manual-check` exits 0 is not a stop.
+
 ## Web dashboard
 
 ```
