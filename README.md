@@ -20,6 +20,8 @@ work.
 | `--shared-env-file <path>` | | `<working-dir>/.env.shared` | Same idea, for the committed non-secret file — see "Two env files" below. |
 | `--verbose` | `-v` | off | Stream live terraform output to the terminal during `plan`/`apply`, prefixed by directory (`[services/a] ...`), instead of only the one-line summary per directory. Reuses the exact same `Hooks.LiveWriter` mechanism the web server's SSE streaming already uses — no separate code path. Concurrent directories (plan) share one mutex so output can't interleave mid-line. |
 | `--timeout <duration>` | | `0` (none) | Maximum time a `plan`/`apply`/`init` run may take, e.g. `10m`. Without this, a hung provider call blocks forever with no way out except Ctrl+C. Not used by `serve`, which runs indefinitely by design. |
+| `--detailed-exitcode` | | off | `plan` only: exit `0` when no directory has changes, `2` when at least one does, `1` on any error. See "Exit codes and CI output" below. |
+| `--summary-md <file>` | | none | Write a short Markdown summary of the run (for a PR comment or job summary) to `<file>`. Works with `plan`, `apply` and `<dir> plan`; attribute values and raw terraform output are left out on purpose. See "Exit codes and CI output" below. |
 | `--migrate-backend` | | off | With `init`: migrate to the `[backend]` configured in the env files, after an explicit confirmation. See "Remote backend" below. |
 | `--insecure-no-auth` | | off | `serve` only: run the dashboard with **no authentication**. Without it, `serve` refuses to start unless the `HOMELAB_DEPLOY_OIDC_*` settings are present — see "Authentication and roles" below. |
 
@@ -36,11 +38,89 @@ prefixed output actually appearing before the summary line, and a
 deliberately tiny timeout genuinely producing a `context deadline
 exceeded` error rather than silently being ignored.
 
+### Exit codes and CI output
+
+Exit status of `plan` (every directory, or `<dir> plan`):
+
+| Exit | Meaning |
+|---|---|
+| `0` | every directory planned and none has changes (or there are changes but `--detailed-exitcode` was not given) |
+| `1` | at least one directory failed to plan, or the run itself failed (bad flag, no terraform, ...) |
+| `2` | `--detailed-exitcode` only: every directory planned, and at least one has changes |
+
+Errors win over changes, so `2` always means "a clean plan with pending
+changes". **Before this flag existed, a `plan` in which some directory
+failed still exited `0`; it now exits `1`, with or without
+`--detailed-exitcode`.** A scheduled drift check is then just
+`homelab-deploy --non-interactive --detailed-exitcode plan` and treating
+`2` as "drift" and anything else non-zero as "broken".
+
+`apply` exits `0` on success and `1` if any directory failed (it stops at
+the first failure); `--detailed-exitcode` has no effect on it.
+
+`--summary-md <file>` writes a short Markdown digest: one line per
+directory (errors first, then changes, then a single line listing the clean
+ones) with the add/change/destroy counts, each changed resource's address
+and action, warning headlines, and only the **first line** of an error. It
+never contains attribute values, raw terraform output, warning detail or
+the rest of an error message, since any of those can carry a secret; the
+full detail stays in `.deploy-logs/` (upload it as an artifact). Long
+lists are truncated so the file stays under GitHub's 65536-character
+comment limit. The file is written even when the run fails, so a PR
+comment can say why. It is rejected (rather than silently ignored) with
+commands that have nothing to summarise.
+
+#### `.deploy-logs/report.json`
+
+Written by `plan` (always) and by an `apply` that fails; a successful
+`apply` does not write it. There are no JSON struct tags, so the keys are
+the Go field names, which a test pins (`internal/report`). Shape:
+
+```json
+{
+  "GeneratedAt": "2026-11-05T12:00:00Z",
+  "Command": "plan",
+  "Entries": [
+    {
+      "Dir": "services/web",
+      "Status": "CHANGES",
+      "Detail": "1 to add, 1 to change, 0 to destroy",
+      "ResourceChanges": [
+        {
+          "Address": "nomad_job.web",
+          "Action": "update",
+          "Attributes": [{ "Path": "env.TOKEN", "Before": "(sensitive value)", "After": "(sensitive value)" }]
+        }
+      ],
+      "Adds": 1, "Changes": 1, "Destroys": 0,
+      "RawOutput": "…terraform's human-readable output…",
+      "UnsavedPlan": false,
+      "RemotePlanURL": "",
+      "Warnings": [{ "summary": "Argument is deprecated", "detail": "…" }]
+    }
+  ],
+  "Graph": [{ "Dir": "services/web", "DependsOn": [], "Depth": 0, "ManualStep": false, "NotSynced": false }]
+}
+```
+
+- `Status` is `OK` (no changes for `plan`, applied cleanly for `apply`),
+  `CHANGES` or `ERROR`; for `ERROR`, `Detail` is the error text.
+- `Action` is `create`, `update`, `delete` or `replace`; `Attributes` is
+  only filled for `update`/`replace`. Sensitive values are masked as
+  `(sensitive value)`.
+- `Warnings` keys are lowercase, everything else is capitalised (an
+  inconsistency that predates this documentation and is kept for
+  compatibility).
+- `RawOutput`, `Detail` of an error and `Warnings[].detail` are terraform's
+  own text: treat the file as sensitive and do not paste it into a comment.
+  Use `--summary-md` for that.
+- `Graph` can be `null` (e.g. `<dir> plan`).
+
 Ideas for further flags, not built since they'd either duplicate an
 existing mechanism or need more design than a single flag warrants:
 `--concurrency` (redundant with `DEPLOY_PLAN_PARALLELISM`, which already
 covers this), `--json` (machine-readable stdout for scripting — the
-per-run `report.json` already covers the common case), `--only`/`--skip`
+per-run `report.json`, documented above, already covers the common case), `--only`/`--skip`
 <dir> filters for a full run (mentioned under "Extending it later" below,
 since it interacts with dependency-graph semantics enough to deserve its
 own thought rather than a quick flag).
