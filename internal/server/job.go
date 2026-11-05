@@ -89,15 +89,13 @@ func newJob(id, kind string, dirs []string, isFullRun bool) *Job {
 
 // Cancel requests that the job stop as soon as possible — its context is
 // canceled, which terraform-exec propagates to the running `terraform`
-// process the same way the CLI's own --timeout does (context.Context all
-// the way down to exec.CommandContext). There's no way to interrupt a
-// terraform command mid-step more gently than killing it, so a canceled
-// apply may leave a directory's state exactly as inconsistent as a
-// Ctrl-C on the CLI would — this is the same risk the CLI already
-// carries, not a new one introduced by giving the web UI a button for
-// it. Safe to call more than once, or after the job has already
-// finished on its own (a no-op then — reports false as "nothing to
-// cancel").
+// process as an interrupt (SIGINT), the same way the CLI's own --timeout
+// and Ctrl-C do. Terraform treats that as a request to stop gracefully:
+// it saves state for what it already created and releases its state
+// lock, and terraform-exec only force-kills it if it has not exited after
+// its wait delay. Safe to call more than once, or after the job has
+// already finished on its own (a no-op then — reports false as "nothing
+// to cancel").
 func (j *Job) Cancel() bool {
 	j.mu.Lock()
 	if !j.finishedAt.IsZero() {

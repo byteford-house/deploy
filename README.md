@@ -636,20 +636,17 @@ pass).
   single directory from two concurrent applies, but nothing stops two
   browser tabs from starting two overlapping *full* runs without this.
 - **A running job can be canceled** from its own page (`POST
-  /jobs/{id}/cancel`) — the job's context is canceled, which
-  terraform-exec propagates all the way down to the running `terraform`
-  process via `exec.CommandContext`, the same mechanism the CLI's own
-  `--timeout` uses. There's no gentler way to interrupt a command
-  mid-step than killing it, so a canceled apply can leave a directory's
-  state exactly as inconsistent as a Ctrl-C on the CLI would — that risk
-  already existed, this just gives the web UI a way to take it
-  deliberately instead of the job (and the single job slot) being stuck
-  until the process restarts. Verified for real: an `apply` against a
-  directory with an 8-second `local-exec` sleep was canceled and
-  reported `job_done` with `canceled: true` in well under a second, not
-  after the full 8 seconds — proof the terraform process was actually
-  killed, not just marked canceled in this tool's own bookkeeping while
-  it kept running underneath.
+  /jobs/{id}/cancel`) — the job's context is canceled, and terraform-exec
+  turns that into an **interrupt (SIGINT)** to the running `terraform`
+  process, not a kill. Terraform treats the first interrupt as "stop
+  gracefully": it stops what it is doing, writes the state for what it had
+  already created and releases the state lock. If terraform has not exited
+  after 60 seconds (terraform-exec's default wait delay) it is killed, and
+  then the old failure mode applies: a stale state lock (clear it with
+  `terraform force-unlock <id>`) and resources missing from state. The CLI
+  behaves the same way: the first Ctrl-C (or SIGTERM) asks terraform to stop
+  and save state, a second Ctrl-C force-quits. Cancelling is also how a stuck
+  job (and the single job slot) is freed without restarting the process.
 - **Dropped SSE output is surfaced, not silent.** A job's live output is
   fanned out over a bounded-size channel per subscriber and a
   bounded-size replay history (4000 frames); either one filling up
