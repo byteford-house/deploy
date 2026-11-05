@@ -821,20 +821,17 @@ pass).
   single directory from two concurrent applies, but nothing stops two
   browser tabs from starting two overlapping *full* runs without this.
 - **A running job can be canceled** from its own page (`POST
-  /jobs/{id}/cancel`) — the job's context is canceled, which
-  terraform-exec propagates all the way down to the running `terraform`
-  process via `exec.CommandContext`, the same mechanism the CLI's own
-  `--timeout` uses. There's no gentler way to interrupt a command
-  mid-step than killing it, so a canceled apply can leave a directory's
-  state exactly as inconsistent as a Ctrl-C on the CLI would — that risk
-  already existed, this just gives the web UI a way to take it
-  deliberately instead of the job (and the single job slot) being stuck
-  until the process restarts. Verified for real: an `apply` against a
-  directory with an 8-second `local-exec` sleep was canceled and
-  reported `job_done` with `canceled: true` in well under a second, not
-  after the full 8 seconds — proof the terraform process was actually
-  killed, not just marked canceled in this tool's own bookkeeping while
-  it kept running underneath.
+  /jobs/{id}/cancel`) — the job's context is canceled, and terraform-exec
+  turns that into an **interrupt (SIGINT)** to the running `terraform`
+  process, not a kill. Terraform treats the first interrupt as "stop
+  gracefully": it stops what it is doing, writes the state for what it had
+  already created and releases the state lock. If terraform has not exited
+  after 60 seconds (terraform-exec's default wait delay) it is killed, and
+  then the old failure mode applies: a stale state lock (clear it with
+  `terraform force-unlock <id>`) and resources missing from state. The CLI
+  behaves the same way: the first Ctrl-C (or SIGTERM) asks terraform to stop
+  and save state, a second Ctrl-C force-quits. Cancelling is also how a stuck
+  job (and the single job slot) is freed without restarting the process.
 - **Dropped SSE output is surfaced, not silent.** A job's live output is
   fanned out over a bounded-size channel per subscriber and a
   bounded-size replay history (4000 frames); either one filling up
@@ -1236,7 +1233,7 @@ token is needed). Pin the tag, verify the checksum, never use "latest":
 
 ```
 TAG=v0.1.0
-BASE="https://github.com/byteford/deploy/releases/download/$TAG"
+BASE="https://github.com/byteford-house/deploy/releases/download/$TAG"
 curl -fsSLO "$BASE/homelab-deploy_${TAG}_linux_amd64.tar.gz"
 curl -fsSLO "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -1254,20 +1251,20 @@ created (the `image` job runs after `release`; it is a job rather than a
 separate workflow because a release made with `GITHUB_TOKEN` does not
 trigger other workflows). A `v*` tag pushes:
 
-- `ghcr.io/byteford/deploy:<version>` (the tag without the leading `v`)
-- `ghcr.io/byteford/deploy:latest`, except for pre-releases such as `v1.2.3-rc1`
+- `ghcr.io/byteford-house/deploy:<version>` (the tag without the leading `v`)
+- `ghcr.io/byteford-house/deploy:latest`, except for pre-releases such as `v1.2.3-rc1`
 
 A PR touching `Dockerfile`, `.dockerignore` or `release.yml` builds and
 smoke-tests the image without pushing it.
 
-The image is `alpine` with `homelab-deploy`, `terraform` (the **latest**
-release at build time, copied from `hashicorp/terraform:latest`; pin it in
-the Dockerfile if a newer Terraform ever breaks a run), `git` and an `ssh`
-client (for `sync`). It runs as uid 10001 in `/work`, listens on `:8080`
+The image is `alpine` with `homelab-deploy`, `terraform` (pinned by the
+`TERRAFORM_VERSION` build arg at the top of the `Dockerfile`, copied from
+`hashicorp/terraform:<version>`; bump it in a PR when you want a newer
+Terraform), `git` and an `ssh` client (for `sync`). It runs as uid 10001 in `/work`, listens on `:8080`
 and starts `homelab-deploy serve :8080` by default.
 
 ```
-docker run --rm -p 8080:8080 -v "$PWD":/work ghcr.io/byteford/deploy:<version>
+docker run --rm -p 8080:8080 -v "$PWD":/work ghcr.io/byteford-house/deploy:<version>
 ```
 
 Things to know:
@@ -1280,8 +1277,8 @@ Things to know:
 - The binary is built from the tagged commit with the release workflow's
   flags, but it is a separate build from the release tarball, not that
   file.
-- `latest` is a moving tag and so is the Terraform inside it. Pin the
-  version tag when deploying.
+- `latest` is a moving tag. Pin the version tag when deploying; the
+  Terraform inside each version tag is fixed by the `Dockerfile` at that tag.
 - A package pushed to ghcr.io starts private; making it public (or giving
   the puller a token) is a package setting on GitHub.
 

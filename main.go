@@ -16,10 +16,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -157,6 +159,30 @@ commands:
 
 flags (may appear before or after the command):`
 
+// interruptContext returns a context that is cancelled by the first SIGINT or
+// SIGTERM. It then restores the default signal behaviour, so a second signal
+// terminates the process immediately (the escape hatch when terraform is slow
+// to stop; terraform-exec itself force-kills it after its wait delay).
+// Call the returned func when done to release the signal handler.
+func interruptContext(parent context.Context, w io.Writer) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigs:
+			fmt.Fprintln(w, "interrupt received: asking terraform to stop and save state; press Ctrl-C again to force quit")
+			cancel()
+		case <-ctx.Done():
+		}
+		signal.Stop(sigs)
+	}()
+	return ctx, func() {
+		cancel()
+		signal.Stop(sigs)
+	}
+}
+
 // classifyDirArg decides how remaining[0] should be treated once it's
 // matched none of the known subcommands in run's switch: info/statErr
 // are the result of os.Stat'ing it as a directory under repoRoot. Nil
@@ -264,7 +290,15 @@ func run(args []string) error {
 		}
 	}
 
-	ctx := context.Background()
+	// Ctrl-C / SIGTERM cancel ctx instead of killing this process: terraform
+	// runs in its own process group (terraform-exec sets Setpgid), so the
+	// terminal's SIGINT never reaches it. A process that just dies takes
+	// terraform down with SIGKILL (Pdeathsig), which leaves the state lock
+	// behind and loses what an apply had already created. A cancelled ctx
+	// makes terraform-exec send terraform SIGINT, so it saves state and
+	// unlocks before exiting.
+	ctx, stopInterrupt := interruptContext(context.Background(), os.Stderr)
+	defer stopInterrupt()
 	if gf.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, gf.timeout)
