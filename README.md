@@ -20,6 +20,8 @@ work.
 | `--shared-env-file <path>` | | `<working-dir>/.env.shared` | Same idea, for the committed non-secret file — see "Two env files" below. |
 | `--verbose` | `-v` | off | Stream live terraform output to the terminal during `plan`/`apply`, prefixed by directory (`[services/a] ...`), instead of only the one-line summary per directory. Reuses the exact same `Hooks.LiveWriter` mechanism the web server's SSE streaming already uses — no separate code path. Concurrent directories (plan) share one mutex so output can't interleave mid-line. |
 | `--timeout <duration>` | | `0` (none) | Maximum time a `plan`/`apply`/`init` run may take, e.g. `10m`. Without this, a hung provider call blocks forever with no way out except Ctrl+C. Not used by `serve`, which runs indefinitely by design. |
+| `--since <git-ref>` | | none | `changed` only: the ref to compare `HEAD` against. See "Which directories changed" below. |
+| `--with-dependents` | | off | `changed` only: also list every directory that depends (via `.deploy-deps`) on a changed one. |
 | `--migrate-backend` | | off | With `init`: migrate to the `[backend]` configured in the env files, after an explicit confirmation. See "Remote backend" below. |
 | `--insecure-no-auth` | | off | `serve` only: run the dashboard with **no authentication**. Without it, `serve` refuses to start unless the `HOMELAB_DEPLOY_OIDC_*` settings are present — see "Authentication and roles" below. |
 
@@ -45,8 +47,42 @@ per-run `report.json` already covers the common case), `--only`/`--skip`
 since it interacts with dependency-graph semantics enough to deserve its
 own thought rather than a quick flag).
 
+### Which directories changed (`changed`)
+
+`homelab-deploy changed --since <git-ref> [--with-dependents] [lines|json]`
+prints the directories affected by the commits between `<git-ref>` and
+`HEAD`, in dependency (apply) order, so a pull-request workflow can plan only
+those instead of all of them (`homelab-deploy <dir> plan` already runs one
+directory; `changed` is how a workflow learns which ones).
+
+- The comparison is `git diff <ref>...HEAD` (against the merge base), so work
+  that landed on the base branch after you branched is not reported. Only
+  committed changes count; the working tree is not looked at.
+- A directory is reported if a changed file is inside it, or inside a
+  **local module** it uses: a `source = "./..."` or `"../..."` in its `*.tf`
+  files, followed through modules that call other local modules. Registry,
+  git and provider sources are ignored. A file moved between directories
+  counts for both.
+- A change outside every directory and every module they use (the README, a
+  workflow, `.env.shared`) reports nothing. If such a file should trigger a
+  full run, say so in the workflow.
+- `--with-dependents` adds everything that depends on a reported directory,
+  directly or transitively, using `.deploy-deps`. Without it, only the
+  directories themselves are listed.
+- Output is one directory per line (`lines`, the default), or a JSON array
+  (`json`) that is `[]` when nothing changed, so `fromJSON` in a workflow
+  matrix always parses. An unknown ref is an error, never an empty list.
+- Single-repo mode only. With a `.deploy-repos` manifest it refuses to run,
+  since one checkout's diff cannot say which of the other repos changed.
+
+`--only` / `--skip` filters for a full `plan`/`apply` are not built: use the
+list from `changed` with `<dir> plan` / `<dir> apply` instead. Note that
+`<dir> apply` applies exactly that directory and does not look at
+`.deploy-deps` ordering, so applying several directories yourself means
+applying them in the order `changed` prints.
+
 **A directory named exactly `plan`, `apply`, `init`, `sync`, `graph`,
-`open`, or `serve` can never be targeted as `homelab-deploy <dir>`** —
+`changed`, `open`, or `serve` can never be targeted as `homelab-deploy <dir>`** —
 `run`'s dispatch checks known subcommand names first, so a same-named
 directory is always interpreted as the subcommand instead. Rename the
 directory, or run terraform in it directly, if this ever comes up in
