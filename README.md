@@ -1051,7 +1051,7 @@ token is needed). Pin the tag, verify the checksum, never use "latest":
 
 ```
 TAG=v0.1.0
-BASE="https://github.com/byteford/deploy/releases/download/$TAG"
+BASE="https://github.com/byteford-house/deploy/releases/download/$TAG"
 curl -fsSLO "$BASE/homelab-deploy_${TAG}_linux_amd64.tar.gz"
 curl -fsSLO "$BASE/SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -1069,20 +1069,20 @@ created (the `image` job runs after `release`; it is a job rather than a
 separate workflow because a release made with `GITHUB_TOKEN` does not
 trigger other workflows). A `v*` tag pushes:
 
-- `ghcr.io/byteford/deploy:<version>` (the tag without the leading `v`)
-- `ghcr.io/byteford/deploy:latest`, except for pre-releases such as `v1.2.3-rc1`
+- `ghcr.io/byteford-house/deploy:<version>` (the tag without the leading `v`)
+- `ghcr.io/byteford-house/deploy:latest`, except for pre-releases such as `v1.2.3-rc1`
 
 A PR touching `Dockerfile`, `.dockerignore` or `release.yml` builds and
 smoke-tests the image without pushing it.
 
-The image is `alpine` with `homelab-deploy`, `terraform` (the **latest**
-release at build time, copied from `hashicorp/terraform:latest`; pin it in
-the Dockerfile if a newer Terraform ever breaks a run), `git` and an `ssh`
-client (for `sync`). It runs as uid 10001 in `/work`, listens on `:8080`
+The image is `alpine` with `homelab-deploy`, `terraform` (pinned by the
+`TERRAFORM_VERSION` build arg at the top of the `Dockerfile`, copied from
+`hashicorp/terraform:<version>`; bump it in a PR when you want a newer
+Terraform), `git` and an `ssh` client (for `sync`). It runs as uid 10001 in `/work`, listens on `:8080`
 and starts `homelab-deploy serve :8080` by default.
 
 ```
-docker run --rm -p 8080:8080 -v "$PWD":/work ghcr.io/byteford/deploy:<version>
+docker run --rm -p 8080:8080 -v "$PWD":/work ghcr.io/byteford-house/deploy:<version>
 ```
 
 Things to know:
@@ -1095,8 +1095,8 @@ Things to know:
 - The binary is built from the tagged commit with the release workflow's
   flags, but it is a separate build from the release tarball, not that
   file.
-- `latest` is a moving tag and so is the Terraform inside it. Pin the
-  version tag when deploying.
+- `latest` is a moving tag. Pin the version tag when deploying; the
+  Terraform inside each version tag is fixed by the `Dockerfile` at that tag.
 - A package pushed to ghcr.io starts private; making it public (or giving
   the puller a token) is a package setting on GitHub.
 
