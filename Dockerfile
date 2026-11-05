@@ -1,8 +1,9 @@
 # homelab-deploy: the CLI and its `serve` web dashboard.
 #
 # What the running container needs besides the binary:
-#   - terraform  every plan/apply/init shells out to it (latest release at
-#                build time, copied from HashiCorp's official image)
+#   - terraform  every plan/apply/init shells out to it (the version pinned
+#                by TERRAFORM_VERSION, copied from HashiCorp's official
+#                image, so a rebuild of the same commit is reproducible)
 #   - git, ssh   `sync` clones and updates the repos in .deploy-repos
 #   - CA certs   HTTPS to providers and registries
 #
@@ -11,7 +12,8 @@
 # files at run time. Nothing from the build context's .env files is ever
 # copied in (see .dockerignore).
 
-FROM hashicorp/terraform:latest AS terraform
+ARG TERRAFORM_VERSION=1.17.1
+FROM hashicorp/terraform:${TERRAFORM_VERSION} AS terraform
 
 FROM golang:1.25 AS build
 WORKDIR /src

@@ -94,7 +94,7 @@ jobs:
             "$ASSET" SHA256SUMS
 
   # Container image: Dockerfile builds the same binary from this commit,
-  # on top of alpine with terraform (latest at build time), git and ssh.
+  # on top of alpine with terraform (pinned in the Dockerfile), git and ssh.
   # Pushes to ghcr.io only for a v* tag, and only after `release` succeeded.
   image:
     needs: release
@@ -140,7 +140,7 @@ jobs:
           tag="${VERSION#v}"
           echo "IMAGE=ghcr.io/${repo}" >> "$GITHUB_ENV"
           echo "TAG=${tag}" >> "$GITHUB_ENV"
-          # --pull: always take the current base images, including terraform:latest.
+          # --pull: always take the current base images (the terraform tag is pinned).
           docker build --pull \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
