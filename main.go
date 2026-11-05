@@ -34,9 +34,64 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		var ee *exitError
+		if !errors.As(err, &ee) || ee.msg != "" {
+			fmt.Fprintln(os.Stderr, "error:", err)
+		}
+		os.Exit(exitCodeOf(err))
 	}
+}
+
+// exitError is an error that carries the process exit code, so a command can
+// report an outcome other than plain failure (see --detailed-exitcode). An
+// empty msg means the outcome was already printed and nothing more should be.
+type exitError struct {
+	code int
+	msg  string
+}
+
+func (e *exitError) Error() string { return e.msg }
+
+// exitCodeOf is the process exit status for err: 0 for nil, the carried code
+// for an *exitError, 1 for anything else.
+func exitCodeOf(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exitError
+	if errors.As(err, &ee) {
+		return ee.code
+	}
+	return 1
+}
+
+// exitChanges is the exit status of a plan that found changes when
+// --detailed-exitcode is set (0 = none, 1 = error, 2 = changes: the same
+// convention as `terraform plan -detailed-exitcode`).
+const exitChanges = 2
+
+// outputOptions are the flags that shape what a plan/apply run reports
+// beyond the terminal summary.
+type outputOptions struct {
+	detailedExitcode bool   // plan: exit 2 when any directory has changes
+	summaryMD        string // path to write a redacted Markdown summary to ("" = none)
+}
+
+// checkOutputOptions rejects an output flag on a command that cannot honour
+// it, rather than silently ignoring it (a CI job that asked for a summary
+// would otherwise find no file). cmd is the subcommand; singleDir is true for
+// the `<dir> [plan|apply|init]` form.
+func checkOutputOptions(cmd string, singleDir bool, o outputOptions) error {
+	if o.summaryMD == "" {
+		return nil
+	}
+	switch {
+	case cmd == "plan":
+		return nil
+	case cmd == "apply" && !singleDir:
+		return nil
+	}
+	return fmt.Errorf("--summary-md only applies to `plan`, `apply` and `<dir> plan`, not %q", cmd)
 }
 
 // globalFlags may appear anywhere on the command line — before or after
@@ -52,6 +107,9 @@ type globalFlags struct {
 	migrateBackend bool
 	nonInteractive bool
 	insecureNoAuth bool
+
+	detailedExitcode bool
+	summaryMD        string
 }
 
 func parseFlags(args []string) (globalFlags, []string, error) {
@@ -70,6 +128,9 @@ func parseFlags(args []string) (globalFlags, []string, error) {
 	fs.BoolVar(&gf.migrateBackend, "migrate-backend", false, "with init: migrate to the [backend] configured in the shared/secrets env file, after an explicit confirmation")
 
 	fs.BoolVar(&gf.nonInteractive, "non-interactive", false, "never prompt (for CI): apply refuses to continue past an unsatisfied .manual-before and skips directories whose backend cannot save a plan, instead of waiting on stdin")
+
+	fs.BoolVar(&gf.detailedExitcode, "detailed-exitcode", false, "plan only: exit 0 when no directory has changes, 2 when at least one does, 1 on any error (errors exit 1 with or without this flag)")
+	fs.StringVar(&gf.summaryMD, "summary-md", "", "write a short Markdown summary of the run to this file, suitable for a PR comment; values and raw output are left out (plan, apply, <dir> plan)")
 
 	fs.BoolVar(&gf.insecureNoAuth, "insecure-no-auth", false, "serve only: run the web dashboard with NO authentication, so anyone who can reach the port can plan and apply (otherwise serve refuses to start without the HOMELAB_DEPLOY_OIDC_* settings, see README)")
 
@@ -187,6 +248,22 @@ func run(args []string) error {
 		os.Exit(1)
 	}
 
+	out := outputOptions{detailedExitcode: gf.detailedExitcode, summaryMD: gf.summaryMD}
+	{
+		cmdName, single := remaining[0], false
+		switch cmdName {
+		case "init", "sync", "plan", "apply", "graph", "open", "serve":
+		default: // the `<dir> [plan|apply|init]` form
+			cmdName, single = "plan", true
+			if len(remaining) > 1 {
+				cmdName = remaining[1]
+			}
+		}
+		if err := checkOutputOptions(cmdName, single, out); err != nil {
+			return err
+		}
+	}
+
 	ctx := context.Background()
 	if gf.timeout > 0 {
 		var cancel context.CancelFunc
@@ -206,7 +283,7 @@ func run(args []string) error {
 	case "sync":
 		return cmdSync(ctx, repoRoot)
 	case "plan", "apply":
-		return cmdFullRun(ctx, resolver, repoRoot, remaining[0], gf.verbose, gf.nonInteractive)
+		return cmdFullRun(ctx, resolver, repoRoot, remaining[0], gf.verbose, gf.nonInteractive, out)
 	case "graph":
 		format := "text"
 		if len(remaining) > 1 {
@@ -240,7 +317,7 @@ func run(args []string) error {
 			}
 			return cmdMigrateBackendOne(ctx, resolver, repoRoot, remaining[0], backend)
 		}
-		return cmdSingleDir(ctx, resolver, repoRoot, remaining[0], cmd, gf.verbose, gf.nonInteractive)
+		return cmdSingleDir(ctx, resolver, repoRoot, remaining[0], cmd, gf.verbose, gf.nonInteractive, out)
 	}
 }
 
@@ -364,7 +441,7 @@ func confirmUnsavedPlanCLI(stdin *bufio.Reader) tf.UnsavedPlanConfirm {
 	}
 }
 
-func cmdSingleDir(ctx context.Context, resolver *manifest.Resolver, repoRoot, dir, cmd string, verbose, nonInteractive bool) error {
+func cmdSingleDir(ctx context.Context, resolver *manifest.Resolver, repoRoot, dir, cmd string, verbose, nonInteractive bool, out outputOptions) error {
 	runner, err := newRunner(resolver)
 	if err != nil {
 		return err
@@ -431,10 +508,22 @@ func cmdSingleDir(ctx context.Context, resolver *manifest.Resolver, repoRoot, di
 		// here would just duplicate the same output.
 		fmt.Print(res.RawOutput)
 	}
-	return res.Err
+	if out.summaryMD != "" {
+		rep := report.Report{GeneratedAt: time.Now(), Command: "plan", Entries: []report.Entry{report.FromPlanResult(res)}}
+		if err := report.WriteSummaryMarkdown(out.summaryMD, rep); err != nil {
+			return fmt.Errorf("writing --summary-md: %w", err)
+		}
+	}
+	if res.Err != nil {
+		return res.Err
+	}
+	if out.detailedExitcode && res.HasChanges {
+		return &exitError{code: exitChanges}
+	}
+	return nil
 }
 
-func cmdFullRun(ctx context.Context, resolver *manifest.Resolver, repoRoot, cmd string, verbose, nonInteractive bool) error {
+func cmdFullRun(ctx context.Context, resolver *manifest.Resolver, repoRoot, cmd string, verbose, nonInteractive bool, out outputOptions) error {
 	if cmd == "plan" {
 		// Wipe old logs/reports/plan-files so this run starts clean.
 		// Deliberately NOT done for "apply": a prior "plan" run's saved
@@ -498,6 +587,7 @@ func cmdFullRun(ctx context.Context, resolver *manifest.Resolver, repoRoot, cmd 
 		if applyErr != nil {
 			printSummary(rep.Entries)
 			writeReports(repoRoot, rep) // best-effort, even on failure
+			writeSummaryMD(out.summaryMD, rep)
 			return fmt.Errorf("apply failed — stopping: %w", applyErr)
 		}
 	} else {
@@ -513,10 +603,52 @@ func cmdFullRun(ctx context.Context, resolver *manifest.Resolver, repoRoot, cmd 
 	}
 
 	printSummary(rep.Entries)
+	if err := writeSummaryMD(out.summaryMD, rep); err != nil {
+		return err
+	}
 
 	if cmd == "plan" {
-		return writeReports(repoRoot, rep)
+		if err := writeReports(repoRoot, rep); err != nil {
+			return err
+		}
+		return planOutcome(rep.Entries, out.detailedExitcode)
 	}
+	return nil
+}
+
+// planOutcome turns a finished plan run into its exit status. A directory
+// that failed to plan always fails the run (exit 1): the run did not tell you
+// whether anything changed. Otherwise, with --detailed-exitcode, changes in
+// any directory give exit 2; without it a plan that found changes is success.
+func planOutcome(entries []report.Entry, detailed bool) error {
+	var failed, changed int
+	for _, e := range entries {
+		switch e.Status {
+		case report.StatusError:
+			failed++
+		case report.StatusChanges:
+			changed++
+		}
+	}
+	if failed > 0 {
+		return &exitError{code: 1, msg: fmt.Sprintf("plan failed in %d of %d directories (see above)", failed, len(entries))}
+	}
+	if detailed && changed > 0 {
+		// Already shown in the summary above; nothing more to print.
+		return &exitError{code: exitChanges}
+	}
+	return nil
+}
+
+// writeSummaryMD writes the --summary-md file, if one was asked for.
+func writeSummaryMD(path string, rep report.Report) error {
+	if path == "" {
+		return nil
+	}
+	if err := report.WriteSummaryMarkdown(path, rep); err != nil {
+		return fmt.Errorf("writing --summary-md: %w", err)
+	}
+	fmt.Println("Markdown summary:", path)
 	return nil
 }
 
