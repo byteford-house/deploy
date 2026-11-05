@@ -212,3 +212,14 @@ func TestParseFlags_SinceAndWithDependents(t *testing.T) {
 		t.Errorf("remaining = %v", rest)
 	}
 }
+
+// `changed` is a subcommand, not a directory named "changed": an output flag
+// that does not apply to it must be rejected as such, not mistaken for the
+// `<dir> plan` form (where --summary-md is allowed).
+func TestRun_ChangedIsNotMistakenForADirectoryWhenValidatingOutputFlags(t *testing.T) {
+	t.Chdir(t.TempDir())
+	err := run([]string{"--summary-md", "x.md", "changed", "--since", "main"})
+	if err == nil || !strings.Contains(err.Error(), "--summary-md only applies") {
+		t.Errorf("got %v, want the --summary-md validation error", err)
+	}
+}

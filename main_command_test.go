@@ -120,7 +120,7 @@ func TestCmdSingleDir_PlanOnInitializedDirectorySucceeds(t *testing.T) {
 	repoRoot, dirs := buildFakeRepo(t, 1)
 	resolver := noopResolver(t, repoRoot)
 
-	if err := cmdSingleDir(context.Background(), resolver, repoRoot, dirs[0], "plan", false, false); err != nil {
+	if err := cmdSingleDir(context.Background(), resolver, repoRoot, dirs[0], "plan", false, false, outputOptions{}); err != nil {
 		t.Errorf("cmdSingleDir plan returned %v, want nil", err)
 	}
 }
@@ -137,7 +137,7 @@ func TestCmdSingleDir_PlanOnUninitializedDirectoryErrorsWithHint(t *testing.T) {
 	}
 	resolver := noopResolver(t, repoRoot)
 
-	err := cmdSingleDir(context.Background(), resolver, repoRoot, dir, "plan", false, false)
+	err := cmdSingleDir(context.Background(), resolver, repoRoot, dir, "plan", false, false, outputOptions{})
 	if err == nil {
 		t.Fatal("expected an error for a never-initialized directory")
 	}
@@ -162,7 +162,7 @@ func TestCmdFullRun_PlanWritesReportAndClearsOldLogDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := cmdFullRun(context.Background(), resolver, repoRoot, "plan", false, false); err != nil {
+	if err := cmdFullRun(context.Background(), resolver, repoRoot, "plan", false, false, outputOptions{}); err != nil {
 		t.Fatalf("cmdFullRun plan returned %v, want nil", err)
 	}
 
@@ -194,7 +194,7 @@ func TestCmdFullRun_ApplyRunsEveryDirectoryAndDoesNotWipeLogDirFirst(t *testing.
 		t.Fatal(err)
 	}
 
-	if err := cmdFullRun(context.Background(), resolver, repoRoot, "apply", false, false); err != nil {
+	if err := cmdFullRun(context.Background(), resolver, repoRoot, "apply", false, false, outputOptions{}); err != nil {
 		t.Fatalf("cmdFullRun apply returned %v, want nil", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -484,7 +484,7 @@ func TestCmdSingleDir_NonInteractiveApplyRefusesUnsatisfiedManualStep(t *testing
 		t.Fatal(err)
 	}
 
-	err := cmdSingleDir(context.Background(), resolver, repoRoot, dirs[0], "apply", false, true)
+	err := cmdSingleDir(context.Background(), resolver, repoRoot, dirs[0], "apply", false, true, outputOptions{})
 	if err == nil {
 		t.Fatal("expected an error: manual step is not satisfied and --non-interactive must not step past it")
 	}
@@ -498,7 +498,7 @@ func TestCmdSingleDir_InitRunsInitForOneDirectory(t *testing.T) {
 	repoRoot, dirs := buildFakeRepo(t, 1)
 	resolver := noopResolver(t, repoRoot)
 
-	if err := cmdSingleDir(context.Background(), resolver, repoRoot, dirs[0], "init", false, true); err != nil {
+	if err := cmdSingleDir(context.Background(), resolver, repoRoot, dirs[0], "init", false, true, outputOptions{}); err != nil {
 		t.Fatalf("cmdSingleDir init returned %v, want nil", err)
 	}
 }
