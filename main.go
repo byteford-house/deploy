@@ -12,10 +12,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -112,6 +114,9 @@ type globalFlags struct {
 
 	detailedExitcode bool
 	summaryMD        string
+
+	since          string
+	withDependents bool
 }
 
 func parseFlags(args []string) (globalFlags, []string, error) {
@@ -133,6 +138,8 @@ func parseFlags(args []string) (globalFlags, []string, error) {
 
 	fs.BoolVar(&gf.detailedExitcode, "detailed-exitcode", false, "plan only: exit 0 when no directory has changes, 2 when at least one does, 1 on any error (errors exit 1 with or without this flag)")
 	fs.StringVar(&gf.summaryMD, "summary-md", "", "write a short Markdown summary of the run to this file, suitable for a PR comment; values and raw output are left out (plan, apply, <dir> plan)")
+	fs.StringVar(&gf.since, "since", "", "changed only: the git ref to compare HEAD against (merge-base, like `git diff <ref>...HEAD`), e.g. origin/main")
+	fs.BoolVar(&gf.withDependents, "with-dependents", false, "changed only: also list every directory that depends (via .deploy-deps) on a changed one")
 
 	fs.BoolVar(&gf.insecureNoAuth, "insecure-no-auth", false, "serve only: run the web dashboard with NO authentication, so anyone who can reach the port can plan and apply (otherwise serve refuses to start without the HOMELAB_DEPLOY_OIDC_* settings, see README)")
 
@@ -154,6 +161,7 @@ commands:
   <dir> init                    terraform init just one directory
   <dir> init --migrate-backend  migrate just one directory
   graph [text|dot]              print the dependency graph
+  changed --since <ref> [lines|json]  list directories changed since a git ref (single-repo mode)
   open                          open the last plan's HTML report in a browser
   serve [addr]                  start the live web dashboard (default addr :8080); needs auth settings, see README
 
@@ -278,7 +286,7 @@ func run(args []string) error {
 	{
 		cmdName, single := remaining[0], false
 		switch cmdName {
-		case "init", "sync", "plan", "apply", "graph", "open", "serve":
+		case "init", "sync", "plan", "apply", "graph", "changed", "open", "serve":
 		default: // the `<dir> [plan|apply|init]` form
 			cmdName, single = "plan", true
 			if len(remaining) > 1 {
@@ -318,6 +326,12 @@ func run(args []string) error {
 		return cmdSync(ctx, repoRoot)
 	case "plan", "apply":
 		return cmdFullRun(ctx, resolver, repoRoot, remaining[0], gf.verbose, gf.nonInteractive, out)
+	case "changed":
+		format := "lines"
+		if len(remaining) > 1 {
+			format = remaining[1]
+		}
+		return cmdChanged(os.Stdout, repoRoot, gf.since, gf.withDependents, format)
 	case "graph":
 		format := "text"
 		if len(remaining) > 1 {
@@ -377,6 +391,63 @@ func newRunner(resolver *manifest.Resolver) (*tf.Runner, error) {
 // "pass nothing", which is the previous behavior. The web server builds
 // its own Runner; run() hands it the same settings (see the "serve" case).
 var cliBackend tf.BackendConfig
+
+// cmdChanged prints the directories affected by the commits between since
+// (a git ref, compared as the merge base: `git diff since...HEAD`) and HEAD:
+// directories with a changed file, and directories that use a changed local
+// module. With withDependents it also lists everything that depends on those
+// via .deploy-deps. Output is in apply (dependency) order, as one directory
+// per line or as a JSON array (always an array, [] when nothing changed, so a
+// workflow matrix can parse it). It only reads git and the working tree.
+func cmdChanged(w io.Writer, repoRoot, since string, withDependents bool, format string) error {
+	if since == "" {
+		return errors.New("changed needs --since <git-ref>, e.g. --since origin/main")
+	}
+	if format != "lines" && format != "json" {
+		return fmt.Errorf("unknown format %q (want lines or json)", format)
+	}
+	if manifest.Exists(repoRoot) {
+		return fmt.Errorf("changed only works in single-repo mode: %s declares several repos, and a git diff of one checkout cannot say which of the others changed", manifest.FileName)
+	}
+
+	g, err := graph.Discover(repoRoot)
+	if err != nil {
+		return err
+	}
+	if err := g.Sort(); err != nil {
+		return err
+	}
+
+	cmd := exec.Command("git", "-C", repoRoot, "diff", "--name-only", "--no-renames", "-z", "--relative", since+"...HEAD")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	raw, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("git diff %s...HEAD: %w: %s", since, err, strings.TrimSpace(stderr.String()))
+	}
+	var paths []string
+	for _, p := range strings.Split(string(raw), "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+
+	dirs := g.StacksForPaths(repoRoot, paths)
+	if withDependents {
+		dirs = g.WithDependents(dirs)
+	}
+
+	if format == "json" {
+		if dirs == nil {
+			dirs = []string{}
+		}
+		return json.NewEncoder(w).Encode(dirs)
+	}
+	for _, d := range dirs {
+		fmt.Fprintln(w, d)
+	}
+	return nil
+}
 
 // cmdSync clones any not-yet-checked-out git entry in .deploy-repos and
 // fast-forward-updates any that's already checked out — see
